@@ -18,7 +18,7 @@ from predlab.logs import get_logger
 log = get_logger(__name__)
 
 # Never allowed on any host, whatever the allowlist says.
-FORBIDDEN_PATH = re.compile(r"(portfolio|/orders?\b|/order_groups|/positions|/fills|/balance)", re.I)
+FORBIDDEN_PATH = re.compile(r"(portfolio|/orders?\b|/order_groups|/positions|/fills|/balance)", re.IGNORECASE)
 
 KALSHI_READ_PATHS = [
     re.compile(p)

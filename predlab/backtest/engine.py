@@ -97,7 +97,11 @@ def run_backtest(signals: pd.DataFrame, resolutions: pd.DataFrame, market: Marke
                     cluster_cost[pos.cluster] -= pos.cost
             continue
         fees = fee_for.get(r.series_ticker, default_fees)
-        quote, why = market.quote(r.ticker, ts, execution)
+        # The decision (edge, size, limit) uses what we *see*; the fill uses what the
+        # market actually offers at order time. Normally identical; stress tests can make
+        # the view stale or move the market between decision and order.
+        view = getattr(market, "decision_quote", market.quote)
+        quote, why = view(r.ticker, ts, execution)
         if quote is None:
             rejects[why] += 1
             continue
@@ -130,14 +134,21 @@ def run_backtest(signals: pd.DataFrame, resolutions: pd.DataFrame, market: Marke
             rejects["size_below_one_contract"] += 1
             continue
         limit = q_side - strategy.min_edge - fees.per_contract(a)
-        fr = simulate_buy(quote, side, qty, limit, execution, ts)
+        if view is not market.quote:
+            exec_quote, why = market.quote(r.ticker, ts, execution)
+            if exec_quote is None:
+                rejects[why] += 1
+                continue
+        else:
+            exec_quote = quote
+        fr = simulate_buy(exec_quote, side, qty, limit, execution, ts)
         order_id += 1
         orders.append({"order_id": order_id, "ts": ts, "ticker": r.ticker, "side": side,
                        "limit_price": round(limit, 4), "qty_requested": qty,
                        "qty_filled": fr.qty, "p_model": r.p, "ev_per_contract": round(ev, 4),
                        "status": "filled" if fr.qty >= qty else ("partial" if fr.qty else "unfilled"),
                        "reason": fr.reason, "quote_source": quote.source})
-        mark = quote.yes_bid if side == "yes" else quote.no_bid
+        mark = exec_quote.yes_bid if side == "yes" else exec_quote.no_bid
         for px, q in fr.levels:
             fee = fees.fee(q, px)
             if q * px + fee > pf.cash:

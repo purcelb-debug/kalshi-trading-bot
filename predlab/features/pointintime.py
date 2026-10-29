@@ -24,7 +24,9 @@ from sqlalchemy import Engine, and_, func, select
 
 from predlab.db.schema import ext_observations, mkt_candles, mkt_markets, outcomes
 
-MARKET_FEATURES = ("mkt_mid", "mkt_spread", "mkt_log_volume", "mkt_stale_hours")
+MARKET_FEATURES = ("mkt_mid", "mkt_spread", "mkt_log_volume", "mkt_stale_hours",
+                   "mkt_mom6", "mkt_mom24")
+MOMENTUM_LAGS_H = (6, 24)
 # Kalshi high-temperature series -> station key used by the weather collector (assumption).
 WEATHER_SERIES_STATION = {"KXHIGHNY": "NYC", "KXHIGHCHI": "CHI", "KXHIGHMIA": "MIA"}
 PER_MARKET_SOURCES = ("synthetic", "csv_sports")
@@ -119,7 +121,23 @@ def _market_state(engine: Engine, base: pd.DataFrame) -> pd.DataFrame:
         left_on="decision_ts", right_on="mkt_ts", by="ticker", direction="backward")
     merged["mkt_log_volume"] = np.log1p(merged["cum_vol"].fillna(0))
     merged["mkt_stale_hours"] = (merged["decision_ts"] - merged["mkt_ts"]).dt.total_seconds() / 3600
+    # Momentum: change in logit(mid) since the last mid known `lag` hours before decision.
+    # Lagged quotes are strictly older than the current one, so no look-ahead is added.
+    hist = candles.dropna(subset=["mkt_mid"]).rename(columns={"end_ts": "lag_ts"})
+    for lag in MOMENTUM_LAGS_H:
+        left = merged[["ticker", "decision_ts"]].assign(
+            lag_key=merged["decision_ts"] - pd.Timedelta(hours=lag)).sort_values("lag_key")
+        old = pd.merge_asof(left, hist.sort_values("lag_ts")[["ticker", "lag_ts", "mkt_mid"]],
+                            left_on="lag_key", right_on="lag_ts", by="ticker",
+                            direction="backward").set_index(["ticker", "decision_ts"])["mkt_mid"]
+        old = old.reindex(pd.MultiIndex.from_frame(merged[["ticker", "decision_ts"]])).to_numpy()
+        merged[f"mkt_mom{lag}"] = _logit(merged["mkt_mid"].to_numpy()) - _logit(old)
     return merged.drop(columns=["cum_vol", "decision_ts"])
+
+
+def _logit(p):
+    p = np.clip(np.asarray(p, dtype=float), 0.005, 0.995)
+    return np.log(p / (1 - p))
 
 
 def _per_market_obs(engine: Engine, base: pd.DataFrame) -> pd.DataFrame:

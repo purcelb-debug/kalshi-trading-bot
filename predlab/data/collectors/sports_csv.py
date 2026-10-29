@@ -44,7 +44,7 @@ def _market_row(r: dict, now) -> dict:
 
 async def load_sports_csv(engine: Engine, path: str | Path):
     now = utcnow()
-    with open(path, newline="", encoding="utf-8") as f:
+    with open(path, newline="", encoding="utf-8") as f:  # noqa: ASYNC230 - small local file
         reader = csv.DictReader(f)
         missing = REQUIRED - set(reader.fieldnames or [])
         if missing:

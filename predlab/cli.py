@@ -157,7 +157,7 @@ def _dataset(source, category, series, horizon_hours, no_market_features):
 
 
 def _factories(models: str):
-    from predlab.models.baselines import MODEL_FACTORIES
+    from predlab.models.registry import ALL_MODELS as MODEL_FACTORIES
 
     names = list(MODEL_FACTORIES) if models == "all" else [m.strip() for m in models.split(",")]
     unknown = set(names) - set(MODEL_FACTORIES)
@@ -311,6 +311,94 @@ def backtest(model: str = typer.Option(...), source: str = "", category: str = "
                                     "sensitivity": None if grid is None else grid.to_dict("records")},
                                    indent=2, default=str), encoding="utf-8")
     typer.echo(f"report: {out_path}")
+
+
+@app.command("compare-categories")
+def compare_categories_cmd(source: str = "", series: str = "",
+                           models: str = "frequency_bayes,logistic_l2,lightgbm,market_platt",
+                           folds: int = 5, horizon_hours: float = 6.0, min_rows: int = 100,
+                           n_boot: int = 300):
+    """Rank categories by forecasting quality and reliability (not a betting ranking)."""
+    import json
+    from datetime import timedelta
+    from pathlib import Path
+
+    import pandas as pd
+
+    from predlab.evaluation.category_rank import DISCLAIMER, compare_categories
+    from predlab.timeutil import utcnow
+
+    table, skipped = compare_categories(
+        _market_engine(), _factories(models), source=source or None, series=series or None,
+        horizon=timedelta(hours=horizon_hours), n_folds=folds, min_rows=min_rows, n_boot=n_boot)
+    typer.secho(DISCLAIMER, fg=typer.colors.YELLOW)
+    if table.empty:
+        typer.echo(f"no category had enough data: {skipped}")
+        raise typer.Exit(1)
+    cols = ["rank", "category", "n", "best_model", "brier", "log_loss", "ece", "fold_brier_sd",
+            "vs_market_brier_diff", "oos_win_share", "independent_info", "market_coverage",
+            "est_cost_per_contract", "freshness_days"]
+    with pd.option_context("display.width", 250):
+        typer.echo(table[cols].round(4).to_string(index=False))
+    for cat, why in skipped.items():
+        typer.echo(f"skipped {cat}: {why}")
+    out = Path("reports") / f"categories-{utcnow():%Y%m%dT%H%M%SZ}.json"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(json.dumps({"banner": BANNER, "disclaimer": DISCLAIMER,
+                               "table": table.to_dict("records"), "skipped": skipped},
+                              indent=2, default=str), encoding="utf-8")
+    typer.echo(f"report: {out}")
+
+
+@app.command("stress")
+def stress_cmd(model: str = typer.Option(...), source: str = "", category: str = "",
+               series: str = "", folds: int = 5, horizon_hours: float = 6.0,
+               no_market_features: bool = False, initial_cash: float = 1000.0,
+               min_edge: float = 0.03, probe: bool = True):
+    """Stress-test a model's out-of-sample paper trading, plus overfitting probes."""
+    import json
+    from pathlib import Path
+
+    import pandas as pd
+
+    from predlab.backtest.engine import StrategyConfig, fee_schedules, signals_from_walk_forward
+    from predlab.backtest.execution import MarketData
+    from predlab.backtest.stress import run_stress_suite
+    from predlab.evaluation.overfit import multiple_testing_check, shuffled_label_probe
+    from predlab.evaluation.walkforward import run_walk_forward
+    from predlab.timeutil import utcnow
+
+    eng = _market_engine()
+    ds = _dataset(source, category, series, horizon_hours, no_market_features)
+    facs = _factories(model)
+    wf = run_walk_forward(ds, facs, n_folds=folds, n_boot=200)
+    sig, res = signals_from_walk_forward(wf, model, ds)
+    table = run_stress_suite(sig, res, MarketData(eng, sig["ticker"]),
+                             strategy=StrategyConfig(initial_cash=initial_cash, min_edge=min_edge),
+                             fee_for=fee_schedules(eng),
+                             fee_for_stress=lambda m: fee_schedules(eng, m))
+    typer.secho(f"{BANNER}  stress suite for {wf.versions.get(model)}", bold=True)
+    with pd.option_context("display.width", 200):
+        typer.echo(table.to_string(index=False))
+    extra = {}
+    if probe:
+        extra["shuffled_label_probe"] = shuffled_label_probe(ds, facs, n_folds=min(folds, 3))
+        extra["multiple_testing"] = multiple_testing_check(wf)
+        typer.echo("")
+        typer.echo("shuffled-label probe (gain vs constant on permuted labels; ~0 expected):")
+        for m, v in extra["shuffled_label_probe"].items():
+            flag = "  <-- SUSPICIOUS: possible leakage" if v["suspicious"] else ""
+            typer.echo(f"  {m:<20} {v['mean_gain_vs_constant']:+.5f}{flag}")
+        typer.echo("multiple-testing (Bonferroni) edge vs market:")
+        for m, v in extra["multiple_testing"].items():
+            typer.echo(f"  {m:<20} diff {v['diff']:+.4f} CI [{v['low']:+.4f}, {v['high']:+.4f}] "
+                       f"survives={v['survives']}")
+    out = Path("reports") / f"stress-{utcnow():%Y%m%dT%H%M%SZ}.json"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(json.dumps({"banner": BANNER, "model_version": wf.versions.get(model),
+                               "stress": table.to_dict("records"), **extra},
+                              indent=2, default=str), encoding="utf-8")
+    typer.echo(f"report: {out}")
 
 
 if __name__ == "__main__":
