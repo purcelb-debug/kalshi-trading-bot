@@ -242,6 +242,15 @@ model_registry = Table(
     Column("status_ts", UTCDateTime),
 )
 
+# One row per (model version, holdout): enforces that a holdout is scored only once.
+holdout_evaluations = Table(
+    "holdout_evaluations", SIM_MD,
+    Column("model_version", String, primary_key=True),
+    Column("holdout_hash", String, primary_key=True),
+    Column("evaluated_ts", UTCDateTime, nullable=False),
+    Column("metrics", JSON),
+)
+
 sim_runs = Table(
     "sim_runs", SIM_MD,
     Column("run_id", String, primary_key=True),

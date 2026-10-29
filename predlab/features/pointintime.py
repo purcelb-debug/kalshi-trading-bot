@@ -1,0 +1,277 @@
+"""Point-in-time dataset construction.
+
+For each settled binary market a *decision time* is chosen (``close_time - horizon``).
+Every input is filtered to what was publicly knowable at that moment:
+
+* candles: ``end_ts <= decision_ts`` (a candle is only known once its period ends)
+* external observations: ``vintage_ts <= decision_ts`` (first-release values, not revisions)
+
+``input_max_ts`` (the latest timestamp actually used) is recorded per row and checked
+against the decision time, so a leak raises instead of silently inflating skill.
+
+Label availability (``label_ts``) is the market's expiration time, which is conservative
+(Kalshi's ``expiration_time`` is the latest possible settlement). The splitter only trains
+on rows whose label was known before the validation window starts.
+"""
+
+import re
+from dataclasses import dataclass, field
+from datetime import date, timedelta
+
+import numpy as np
+import pandas as pd
+from sqlalchemy import Engine, and_, func, select
+
+from predlab.db.schema import ext_observations, mkt_candles, mkt_markets, outcomes
+
+MARKET_FEATURES = ("mkt_mid", "mkt_spread", "mkt_log_volume", "mkt_stale_hours")
+# Kalshi high-temperature series -> station key used by the weather collector (assumption).
+WEATHER_SERIES_STATION = {"KXHIGHNY": "NYC", "KXHIGHCHI": "CHI", "KXHIGHMIA": "MIA"}
+PER_MARKET_SOURCES = ("synthetic", "csv_sports")
+STALE_HOURS = 6.0
+WIDE_SPREAD = 0.10
+_EVENT_DATE = re.compile(r"-(\d{2})([A-Z]{3})(\d{2})$")
+_MONTHS = {m: i for i, m in enumerate(
+    ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"), 1)}
+
+
+class LookAheadError(AssertionError):
+    pass
+
+
+@dataclass
+class Dataset:
+    X: pd.DataFrame
+    y: np.ndarray
+    meta: pd.DataFrame
+    feature_names: list[str] = field(default_factory=list)
+
+    def __len__(self):
+        return len(self.y)
+
+    def subset(self, mask) -> "Dataset":
+        mask = np.asarray(mask)
+        return Dataset(self.X[mask].reset_index(drop=True), self.y[mask],
+                       self.meta[mask].reset_index(drop=True), list(self.feature_names))
+
+
+def _to_ts(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s, utc=True)
+
+
+def load_markets(engine: Engine, *, source=None, category=None, series=None) -> pd.DataFrame:
+    """Settled binary markets with their latest yes/no outcome and revision flag."""
+    latest = (select(outcomes.c.ticker, func.max(outcomes.c.recorded_at).label("rec"),
+                     func.max(outcomes.c.revised).label("revised"))
+              .group_by(outcomes.c.ticker).subquery())
+    q = (select(mkt_markets.c.ticker, mkt_markets.c.source, mkt_markets.c.category,
+                mkt_markets.c.series_ticker, mkt_markets.c.event_ticker, mkt_markets.c.open_time,
+                mkt_markets.c.close_time, mkt_markets.c.expiration_time,
+                mkt_markets.c.strike_type, mkt_markets.c.floor_strike, mkt_markets.c.cap_strike,
+                outcomes.c.result, latest.c.revised)
+         .join(latest, latest.c.ticker == mkt_markets.c.ticker)
+         .join(outcomes, and_(outcomes.c.ticker == latest.c.ticker,
+                              outcomes.c.recorded_at == latest.c.rec))
+         .where(outcomes.c.result.in_(("yes", "no"))))
+    for col, val in ((mkt_markets.c.source, source), (mkt_markets.c.category, category),
+                     (mkt_markets.c.series_ticker, series)):
+        if val is not None:
+            q = q.where(col.in_(val) if isinstance(val, (list, tuple, set)) else col == val)
+    with engine.connect() as c:
+        df = pd.DataFrame(c.execute(q).mappings().all())
+    if df.empty:
+        return df
+    for col in ("open_time", "close_time", "expiration_time"):
+        df[col] = _to_ts(df[col])
+    df["revised"] = df["revised"].fillna(False).astype(bool)
+    return df
+
+
+def _market_state(engine: Engine, base: pd.DataFrame) -> pd.DataFrame:
+    """As-of join of the last *completed* hourly candle before each decision time."""
+    tickers = base["ticker"].tolist()
+    frames = []
+    with engine.connect() as c:
+        for i in range(0, len(tickers), 900):
+            q = (select(mkt_candles.c.ticker, mkt_candles.c.end_ts, mkt_candles.c.yes_bid_close,
+                        mkt_candles.c.yes_ask_close, mkt_candles.c.volume)
+                 .where(mkt_candles.c.period_minutes == 60,
+                        mkt_candles.c.ticker.in_(tickers[i:i + 900])))
+            frames.append(pd.DataFrame(c.execute(q).mappings().all()))
+    candles = pd.concat(frames) if frames else pd.DataFrame()
+    out = base[["ticker", "decision_ts"]].copy()
+    if candles.empty:
+        for f in MARKET_FEATURES:
+            out[f] = np.nan
+        out["mkt_ts"] = pd.NaT
+        return out.drop(columns="decision_ts")
+    candles["end_ts"] = _to_ts(candles["end_ts"])
+    candles = candles.sort_values(["ticker", "end_ts"])
+    candles["cum_vol"] = candles.groupby("ticker")["volume"].cumsum()
+    bid, ask = candles["yes_bid_close"], candles["yes_ask_close"]
+    valid = (ask > 0) & (ask > bid) & bid.notna() & ask.notna()
+    candles["mkt_mid"] = np.where(valid, (bid + ask) / 2, np.nan)
+    candles["mkt_spread"] = np.where(valid, ask - bid, np.nan)
+    merged = pd.merge_asof(
+        out.sort_values("decision_ts"),
+        candles.rename(columns={"end_ts": "mkt_ts"}).sort_values("mkt_ts")[
+            ["ticker", "mkt_ts", "mkt_mid", "mkt_spread", "cum_vol"]],
+        left_on="decision_ts", right_on="mkt_ts", by="ticker", direction="backward")
+    merged["mkt_log_volume"] = np.log1p(merged["cum_vol"].fillna(0))
+    merged["mkt_stale_hours"] = (merged["decision_ts"] - merged["mkt_ts"]).dt.total_seconds() / 3600
+    return merged.drop(columns=["cum_vol", "decision_ts"])
+
+
+def _per_market_obs(engine: Engine, base: pd.DataFrame) -> pd.DataFrame:
+    """Observations keyed ``<feature>:<ticker>`` (e.g. synthetic x1..x3, sports ref_p)."""
+    tickers = base["ticker"].tolist()
+    with engine.connect() as c:
+        obs = pd.DataFrame(c.execute(
+            select(ext_observations.c.series_id, ext_observations.c.vintage_ts,
+                   ext_observations.c.value)
+            .where(ext_observations.c.source.in_(PER_MARKET_SOURCES))).mappings().all())
+    if obs.empty:
+        return pd.DataFrame({"ticker": tickers})
+    obs["feature"] = obs["series_id"].str.split(":", n=1).str[0]
+    obs["ticker"] = obs["series_id"].str.split(":", n=1).str[1]
+    obs["vintage_ts"] = _to_ts(obs["vintage_ts"])
+    obs = obs.merge(base[["ticker", "decision_ts"]], on="ticker")
+    obs = obs[obs["vintage_ts"] <= obs["decision_ts"]]          # point-in-time filter
+    obs = obs.sort_values("vintage_ts").groupby(["ticker", "feature"]).tail(1)
+    wide = obs.pivot(index="ticker", columns="feature", values="value")
+    wide.columns = [f"obs_{c}" for c in wide.columns]
+    ts = obs.groupby("ticker")["vintage_ts"].max().rename("obs_ts")
+    return wide.join(ts).reset_index()
+
+
+def _event_date(event_ticker: str) -> date | None:
+    m = _EVENT_DATE.search(event_ticker or "")
+    if not m or m.group(2) not in _MONTHS:
+        return None
+    return date(2000 + int(m.group(1)), _MONTHS[m.group(2)], int(m.group(3)))
+
+
+def _margin(level, strike_type, floor, cap):
+    """Signed distance of a temperature estimate from the YES region (positive = inside)."""
+    if strike_type == "greater" and floor is not None:
+        return level - floor
+    if strike_type == "less" and cap is not None:
+        return cap - level
+    if strike_type == "between" and floor is not None and cap is not None:
+        return min(level - floor, cap - level)
+    return np.nan
+
+
+def _weather(engine: Engine, base: pd.DataFrame) -> pd.DataFrame:
+    """Margin of the YES strike vs a trailing 7-day observed-TMAX mean and vs the latest
+    NWS forecast, each restricted to values public at decision time."""
+    rows = []
+    wx = base[base["series_ticker"].isin(WEATHER_SERIES_STATION)]
+    if wx.empty:
+        return pd.DataFrame({"ticker": base["ticker"]})
+    stations = {WEATHER_SERIES_STATION[s] for s in wx["series_ticker"].unique()}
+    ids = [f"tmax:{s}" for s in stations] + [f"fcst_high:{s}" for s in stations]
+    with engine.connect() as c:
+        obs = pd.DataFrame(c.execute(
+            select(ext_observations.c.series_id, ext_observations.c.obs_ts,
+                   ext_observations.c.vintage_ts, ext_observations.c.value)
+            .where(ext_observations.c.series_id.in_(ids))).mappings().all())
+    if obs.empty:
+        return pd.DataFrame({"ticker": base["ticker"]})
+    obs["obs_ts"], obs["vintage_ts"] = _to_ts(obs["obs_ts"]), _to_ts(obs["vintage_ts"])
+    obs = obs.dropna(subset=["value"])
+    by_id = {k: g.sort_values("obs_ts") for k, g in obs.groupby("series_id")}
+    for r in wx.itertuples():
+        st = WEATHER_SERIES_STATION[r.series_ticker]
+        target = _event_date(r.event_ticker)
+        row = {"ticker": r.ticker, "wx_margin_clim7": np.nan, "wx_margin_nws": np.nan,
+               "wx_ts": pd.NaT}
+        if target is None:
+            rows.append(row)
+            continue
+        target_ts = pd.Timestamp(target, tz="UTC")
+        used = []
+        tm = by_id.get(f"tmax:{st}")
+        if tm is not None:
+            known = tm[(tm["vintage_ts"] <= r.decision_ts) & (tm["obs_ts"] < target_ts)].tail(7)
+            if len(known) >= 3:
+                row["wx_margin_clim7"] = _margin(known["value"].mean(), r.strike_type,
+                                                 r.floor_strike, r.cap_strike)
+                used.append(known["vintage_ts"].max())
+        fc = by_id.get(f"fcst_high:{st}")
+        if fc is not None:
+            f = fc[(fc["obs_ts"] == target_ts) & (fc["vintage_ts"] <= r.decision_ts)]
+            if not f.empty:
+                last = f.sort_values("vintage_ts").iloc[-1]
+                row["wx_margin_nws"] = _margin(last["value"], r.strike_type, r.floor_strike,
+                                               r.cap_strike)
+                used.append(last["vintage_ts"])
+        row["wx_ts"] = max(used) if used else pd.NaT
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+FEATURE_SETS = {"market": _market_state, "per_market_obs": _per_market_obs, "weather": _weather}
+
+
+def build_dataset(engine: Engine, *, source=None, category=None, series=None,
+                  horizon: timedelta = timedelta(hours=6),
+                  feature_sets=("market", "per_market_obs", "weather"),
+                  use_market_features: bool = True) -> Dataset:
+    base = load_markets(engine, source=source, category=category, series=series)
+    if base.empty:
+        raise ValueError("no settled binary markets match the filters")
+    base["decision_ts"] = base["close_time"] - horizon
+    early = base["open_time"].notna() & (base["decision_ts"] < base["open_time"])
+    base.loc[early, "decision_ts"] = base.loc[early, "open_time"]
+    base["label_ts"] = base["expiration_time"].fillna(base["close_time"])
+    base = base.sort_values(["decision_ts", "ticker"]).reset_index(drop=True)
+
+    feats = base[["ticker"]].copy()
+    ts_cols = []
+    for name in feature_sets:
+        part = FEATURE_SETS[name](engine, base)
+        feats = feats.merge(part, on="ticker", how="left")
+        ts_cols += [c for c in part.columns if c in ("mkt_ts", "obs_ts", "wx_ts")]
+    feats = base[["ticker"]].merge(feats, on="ticker", how="left")  # restore order
+
+    input_max = feats[ts_cols].max(axis=1) if ts_cols else pd.Series(pd.NaT, index=feats.index)
+    input_max = pd.to_datetime(input_max, utc=True)
+    leaked = input_max.notna() & (input_max > base["decision_ts"])
+    if leaked.any():
+        raise LookAheadError(f"{int(leaked.sum())} rows use inputs after their decision time, "
+                             f"e.g. {base.loc[leaked, 'ticker'].iloc[0]}")
+
+    feature_cols = [c for c in feats.columns if c not in ("ticker", *ts_cols)]
+    if not use_market_features:
+        feature_cols = [c for c in feature_cols if c not in MARKET_FEATURES]
+    feature_cols = [c for c in feature_cols if feats[c].notna().any()]
+
+    flags = []
+    for i in range(len(base)):
+        f = []
+        mid = feats.at[i, "mkt_mid"] if "mkt_mid" in feats else np.nan
+        if pd.isna(mid):
+            f.append("no_market_price")
+        else:
+            if feats.at[i, "mkt_stale_hours"] > STALE_HOURS:
+                f.append("stale_market_price")
+            if feats.at[i, "mkt_spread"] > WIDE_SPREAD:
+                f.append("wide_spread")
+        if feature_cols and feats.loc[i, feature_cols].isna().any():
+            f.append("missing_features")
+        if base.at[i, "revised"]:
+            f.append("outcome_revised")
+        if early[i]:
+            f.append("decision_clamped_to_open")
+        flags.append(f)
+
+    meta = base[["ticker", "source", "category", "series_ticker", "event_ticker",
+                 "decision_ts", "label_ts"]].copy()
+    meta["input_max_ts"] = input_max.fillna(meta["decision_ts"])
+    meta["market_mid"] = feats.get("mkt_mid", np.nan)
+    meta["cluster"] = meta["event_ticker"].fillna(meta["ticker"])
+    meta["dq_flags"] = flags
+    X = feats[feature_cols].astype(float).reset_index(drop=True)
+    y = (base["result"] == "yes").to_numpy(dtype=float)
+    return Dataset(X, y, meta, feature_cols)

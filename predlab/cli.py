@@ -146,5 +146,96 @@ def health():
             typer.echo(f"  {t.name:<26} {conn.execute(select(func.count()).select_from(t)).scalar()}")
 
 
+def _dataset(source, category, series, horizon_hours, no_market_features):
+    from datetime import timedelta
+
+    from predlab.features.pointintime import build_dataset
+
+    return build_dataset(_market_engine(), source=source or None, category=category or None,
+                         series=series or None, horizon=timedelta(hours=horizon_hours),
+                         use_market_features=not no_market_features)
+
+
+def _factories(models: str):
+    from predlab.models.baselines import MODEL_FACTORIES
+
+    names = list(MODEL_FACTORIES) if models == "all" else [m.strip() for m in models.split(",")]
+    unknown = set(names) - set(MODEL_FACTORIES)
+    if unknown:
+        raise typer.BadParameter(f"unknown models: {sorted(unknown)}; "
+                                 f"choose from {sorted(MODEL_FACTORIES)}")
+    if "market_implied" not in names:
+        names.insert(0, "market_implied")  # always keep the reference to beat
+    return {n: MODEL_FACTORIES[n] for n in names}
+
+
+@app.command("evaluate")
+def evaluate(source: str = "", category: str = "", series: str = "",
+             models: str = "all", folds: int = 5, holdout_frac: float = 0.2,
+             horizon_hours: float = 6.0, embargo_hours: float = 0.0, min_train: int = 50,
+             no_market_features: bool = False, n_boot: int = 500):
+    """Walk-forward evaluation (the holdout is carved off and NOT touched)."""
+    import json
+    from datetime import timedelta
+    from pathlib import Path
+
+    from predlab.evaluation.walkforward import run_walk_forward
+    from predlab.timeutil import utcnow
+
+    ds = _dataset(source, category, series, horizon_hours, no_market_features)
+    res = run_walk_forward(ds, _factories(models), n_folds=folds, holdout_frac=holdout_frac,
+                           min_train=min_train, embargo=timedelta(hours=embargo_hours),
+                           n_boot=n_boot)
+    typer.echo(f"rows={len(ds)} features={ds.feature_names}")
+    typer.echo(f"folds={len(res.folds)} validated={res.predictions['ticker'].nunique()} "
+               f"holdout={len(res.holdout_rows)} (hash {res.holdout_hash[:12]}, untouched)")
+    typer.echo(res.table().round(4).to_string())
+    typer.echo("vs_market_brier_diff < 0 means better than the market; if the CI spans 0, "
+               "the difference is not distinguishable.")
+    if res.market_coverage < 0.95:
+        typer.secho(f"WARNING: only {res.market_coverage:.0%} of validated markets have a "
+                    "market price at decision time. For the rest, 'market_implied' is the "
+                    "training base rate, so vs_market is NOT a comparison with the market. "
+                    "Ingest candles (--candles) for a real market reference.",
+                    fg=typer.colors.RED)
+    if res.errors:
+        typer.secho(f"model errors: {res.errors}", fg=typer.colors.RED)
+    out = Path("reports") / f"evaluate-{utcnow():%Y%m%dT%H%M%SZ}.json"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(json.dumps({"banner": BANNER, "filters": {"source": source,
+                               "category": category, "series": series},
+                               "versions": res.versions, "holdout_hash": res.holdout_hash,
+                               "market_coverage": res.market_coverage,
+                               "summary": res.summary, "errors": res.errors},
+                              indent=2, default=str), encoding="utf-8")
+    typer.echo(f"report: {out}")
+
+
+@app.command("holdout")
+def holdout(model: str = typer.Option(...), source: str = "", category: str = "",
+            series: str = "", holdout_frac: float = 0.2, horizon_hours: float = 6.0,
+            embargo_hours: float = 0.0, no_market_features: bool = False):
+    """Score ONE model on the untouched holdout. Allowed once per model version."""
+    from datetime import timedelta
+
+    from predlab.evaluation.splits import HoldoutGuard, holdout_split
+    from predlab.evaluation.walkforward import EvalResult, evaluate_holdout
+
+    s = get_settings()
+    sim = make_engine(s.sim_db_url)
+    init_sim_db(sim)
+    ds = _dataset(source, category, series, horizon_hours, no_market_features)
+    dev, hold, h = holdout_split(ds, holdout_frac)
+    res = EvalResult(None, {}, [], h, hold, dev)
+    make = _factories(model)[model]
+    m = evaluate_holdout(ds, res, model, make, HoldoutGuard(sim),
+                         embargo=timedelta(hours=embargo_hours))
+    typer.echo(f"{m['model_version']} on holdout {h[:12]} (n={m['n']}, "
+               f"trained on {m['train_rows']} rows)")
+    for k in ("brier", "log_loss", "ece"):
+        v = m[k]
+        typer.echo(f"  {k:<9} {v['estimate']:.4f}  [{v['low']:.4f}, {v['high']:.4f}]")
+
+
 if __name__ == "__main__":
     app()
