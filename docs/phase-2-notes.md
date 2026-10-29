@@ -33,7 +33,7 @@
 **Real: KXHIGHNY** (9,826 markets, one feature `wx_margin_clim7`, no market features):
 - logistic_l2 Brier 0.1445 [0.1436, 0.1454] vs base rate 0.1485, a difference of −0.0039 [−0.0044, −0.0035].
 - **Caveat:** that comparison is against the base rate, not the market. No candles had been downloaded, so `market_implied` fell back to the base rate. The CLI now prints a warning whenever market-price coverage is under 95%.
-- Real-market comparison: _pending candle download (see below)._
+- Real-market comparison (after the Phase 3 candle-scaling fix, 30h horizon): market mid Brier 0.1269. Weather-only logistic 0.1446 is *worse* than the market (+0.0177). Market-aware logistic 0.1192 is better (−0.0078, CI [−0.0093, −0.0064]). See phase-3-notes for why that edge doesn't survive trading costs.
 
 ## Unsupported assumptions
 1. Decision time = close − 6h by default. Real traders could act earlier or later. The `--horizon-hours` option exists, but results haven't been checked for sensitivity to it.

@@ -5,7 +5,12 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 .env
-data/
-reports/
+/data/
+/reports/
 *.db
 *.sqlite
+executor/.env
+executor/data/
+executor/KILL_SWITCH
+*.pem
+*.key

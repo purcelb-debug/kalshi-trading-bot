@@ -35,6 +35,9 @@ class EvalResult:
     #: share of validated markets with a real market price; below 1.0 the "market"
     #: reference partly falls back to the training base rate.
     market_coverage: float = float("nan")
+    #: share of validated markets priced <= 0.03 or >= 0.97 at decision time, i.e. the
+    #: outcome was effectively already known; high values mean the horizon is too short.
+    decided_share: float = float("nan")
 
     def table(self) -> pd.DataFrame:
         rows = []
@@ -86,7 +89,9 @@ def run_walk_forward(ds: Dataset, factories: dict[str, Callable[[], Forecaster]]
     summary = _summarize(preds, n_boot)
     validated = ds.meta[ds.meta["ticker"].isin(set(preds["ticker"]))]
     coverage = float(validated["market_mid"].notna().mean())
-    return EvalResult(preds, summary, folds, h, hold, dev, versions, errors, coverage)
+    mid = validated["market_mid"].dropna()
+    decided = float(((mid <= 0.03) | (mid >= 0.97)).mean()) if len(mid) else float("nan")
+    return EvalResult(preds, summary, folds, h, hold, dev, versions, errors, coverage, decided)
 
 
 def _summarize(preds: pd.DataFrame, n_boot: int) -> dict:

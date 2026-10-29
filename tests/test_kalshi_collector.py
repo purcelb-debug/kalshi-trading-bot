@@ -220,3 +220,22 @@ async def test_user_scoped_archive_paths_stay_blocked(settings):
         for path in ("/historical/fills", "/historical/orders", "/historical/positions"):
             with pytest.raises(ReadOnlyViolation):
                 await client.get(path)
+
+
+def test_archive_candles_use_plain_dollar_strings():
+    """Regression (2026-10-29): /historical candlesticks send dollars under plain keys."""
+    from predlab.data.collectors.kalshi import norm_candle
+    from predlab.data.integrity import check_candle
+    from predlab.timeutil import utcnow
+    archive = {"end_period_ts": 1636149600, "volume": "145.00", "open_interest": "575.00",
+               "price": {"close": "0.0100", "high": "0.0200", "low": "0.0100"},
+               "yes_ask": {"close": "0.0300"}, "yes_bid": {"close": "0.0200"}}
+    legacy = {"end_period_ts": 1636149600, "volume": 145,
+              "price": {"close": 1, "high": 2, "low": 1},
+              "yes_ask": {"close": 3}, "yes_bid": {"close": 2}}
+    for raw in (archive, legacy):
+        row = norm_candle(raw, "T", 60, utcnow())
+        assert row["yes_ask_close"] == pytest.approx(0.03)
+        assert row["price_close"] == pytest.approx(0.01)
+    bad = norm_candle(archive, "T", 60, utcnow()) | {"yes_ask_close": 0.0003}
+    assert any(i["check_name"] == "sub_cent_price" for i in check_candle(bad))

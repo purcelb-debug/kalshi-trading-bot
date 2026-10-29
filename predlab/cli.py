@@ -192,6 +192,11 @@ def evaluate(source: str = "", category: str = "", series: str = "",
     typer.echo(res.table().round(4).to_string())
     typer.echo("vs_market_brier_diff < 0 means better than the market; if the CI spans 0, "
                "the difference is not distinguishable.")
+    if res.decided_share > 0.5:
+        typer.secho(f"WARNING: {res.decided_share:.0%} of markets were priced <=3c or >=97c at "
+                    "decision time, so most outcomes were already effectively known. Use a "
+                    "longer --horizon-hours (e.g. 30 for daily weather) before reading any edge.",
+                    fg=typer.colors.RED)
     if res.market_coverage < 0.95:
         typer.secho(f"WARNING: only {res.market_coverage:.0%} of validated markets have a "
                     "market price at decision time. For the rest, 'market_implied' is the "
@@ -206,6 +211,7 @@ def evaluate(source: str = "", category: str = "", series: str = "",
                                "category": category, "series": series},
                                "versions": res.versions, "holdout_hash": res.holdout_hash,
                                "market_coverage": res.market_coverage,
+                               "decided_share": res.decided_share,
                                "summary": res.summary, "errors": res.errors},
                               indent=2, default=str), encoding="utf-8")
     typer.echo(f"report: {out}")
@@ -235,6 +241,76 @@ def holdout(model: str = typer.Option(...), source: str = "", category: str = ""
     for k in ("brier", "log_loss", "ece"):
         v = m[k]
         typer.echo(f"  {k:<9} {v['estimate']:.4f}  [{v['low']:.4f}, {v['high']:.4f}]")
+
+
+@app.command("backtest")
+def backtest(model: str = typer.Option(...), source: str = "", category: str = "",
+             series: str = "", folds: int = 5, holdout_frac: float = 0.2,
+             horizon_hours: float = 6.0, embargo_hours: float = 0.0, min_train: int = 50,
+             no_market_features: bool = False, initial_cash: float = 1000.0,
+             min_edge: float = 0.03, kelly_fraction: float = 0.25,
+             max_market_frac: float = 0.02, slippage: float = 0.01,
+             sensitivity: bool = True):
+    """Paper-trade a model's out-of-sample walk-forward forecasts (holdout untouched)."""
+    import json
+    from datetime import timedelta
+    from pathlib import Path
+
+    from predlab.backtest.engine import (
+        StrategyConfig,
+        fee_schedules,
+        run_backtest,
+        save_run,
+        sensitivity_grid,
+        signals_from_walk_forward,
+    )
+    from predlab.backtest.execution import ExecConfig, MarketData
+    from predlab.backtest.fees import FeeSchedule
+    from predlab.evaluation.walkforward import run_walk_forward
+
+    s = get_settings()
+    eng = _market_engine()
+    sim = make_engine(s.sim_db_url)
+    init_sim_db(sim)
+    ds = _dataset(source, category, series, horizon_hours, no_market_features)
+    wf = run_walk_forward(ds, _factories(model), n_folds=folds, holdout_frac=holdout_frac,
+                          min_train=min_train, embargo=timedelta(hours=embargo_hours), n_boot=200)
+    sig, res = signals_from_walk_forward(wf, model, ds)
+    md = MarketData(eng, sig["ticker"])
+    strat = StrategyConfig(initial_cash=initial_cash, min_edge=min_edge,
+                           kelly_fraction=kelly_fraction, max_market_frac=max_market_frac)
+
+    def run(fee_stress, slip):
+        return run_backtest(sig, res, md, strategy=strat, execution=ExecConfig(slippage=slip),
+                            fee_for=fee_schedules(eng, fee_stress),
+                            default_fees=FeeSchedule(stress=fee_stress))
+
+    out = run(1.0, slippage)
+    run_id = save_run(sim, out, model_version=wf.versions.get(model), holdout_hash=wf.holdout_hash)
+    sm = out.summary
+    typer.secho(f"\n{BANNER}  run {run_id}  model {wf.versions.get(model)}", bold=True)
+    for k in ("n_signals", "n_orders", "n_fills", "contracts", "uncertain_fill_share",
+              "gross_pnl_settled", "fees", "net_pnl", "net_pnl_ci95", "return", "max_drawdown",
+              "peak_exposure", "hit_rate", "brier_all_signals", "brier_traded",
+              "open_positions_at_end", "rejections"):
+        v = sm[k]
+        typer.echo(f"  {k:<24} {round(v, 4) if isinstance(v, float) else v}")
+    if wf.market_coverage < 0.95:
+        typer.secho(f"WARNING: market price coverage {wf.market_coverage:.0%}; markets without "
+                    "quotes cannot be traded (rejected as no_liquidity_data).",
+                    fg=typer.colors.RED)
+    grid = sensitivity_grid(run) if sensitivity else None
+    if grid is not None:
+        typer.echo("\nsensitivity (net P&L by fee multiplier x slippage per contract):")
+        typer.echo(grid.pivot(index="fee_stress", columns="slippage", values="net_pnl")
+                   .round(2).to_string())
+    out_path = Path("reports") / f"backtest-{run_id}.json"
+    out_path.parent.mkdir(exist_ok=True)
+    out_path.write_text(json.dumps({"banner": BANNER, "run_id": run_id, "summary": sm,
+                                    "config": out.config, "market_coverage": wf.market_coverage,
+                                    "sensitivity": None if grid is None else grid.to_dict("records")},
+                                   indent=2, default=str), encoding="utf-8")
+    typer.echo(f"report: {out_path}")
 
 
 if __name__ == "__main__":
