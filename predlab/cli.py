@@ -1,6 +1,7 @@
 """predlab command line. Every command reads public data or runs a local simulation only."""
 
 import asyncio
+import json
 import sys
 from datetime import date
 
@@ -424,6 +425,102 @@ def stress_cmd(model: str = typer.Option(...), source: str = "", category: str =
                                "stress": table.to_dict("records"), **extra},
                               indent=2, default=str), encoding="utf-8")
     typer.echo(f"report: {out}")
+
+
+@app.command("register")
+def register_cmd(model: str = typer.Option(...), series: str = typer.Option(...),
+                 horizon_hours: float = 30.0, folds: int = 5, holdout_frac: float = 0.2,
+                 min_train: int = 50):
+    """Start forward paper trading for (model, series, horizon) WITHOUT touching the
+    holdout. The go-live gate stays closed until `predlab certify` is run."""
+    from predlab.loop.promotion import register_candidate
+
+    s = get_settings()
+    sim = make_engine(s.sim_db_url)
+    init_sim_db(sim)
+    c = register_candidate(_market_engine(), sim, model=model, series=series,
+                           horizon_h=horizon_hours, folds=folds, holdout_frac=holdout_frac,
+                           min_train=min_train)
+    typer.secho(f"{c.deployment}: CANDIDATE (paper only; holdout untouched)", bold=True)
+    typer.echo(f"  shrink kappa from development walk-forward: {c.evidence['shrink_kappa']}")
+    typer.echo(f"  next: predlab loop --deployment \"{c.deployment}\"")
+
+
+@app.command("certify")
+def certify_cmd(model: str = typer.Option(...), series: str = typer.Option(...),
+                horizon_hours: float = 30.0, folds: int = 5, holdout_frac: float = 0.2,
+                min_train: int = 50, embargo_hours: float = 0.0, n_boot: int = 1000):
+    """One look at the untouched holdout for (model, series, horizon): promote or reject.
+    A deployment can be certified only once, ever."""
+    from predlab.loop.promotion import certify
+
+    s = get_settings()
+    sim = make_engine(s.sim_db_url)
+    init_sim_db(sim)
+    c = certify(_market_engine(), sim, model=model, series=series, horizon_h=horizon_hours,
+                folds=folds, holdout_frac=holdout_frac, min_train=min_train,
+                embargo_h=embargo_hours, n_boot=n_boot)
+    color = typer.colors.GREEN if c.status == "promoted" else typer.colors.RED
+    typer.secho(f"{c.deployment}: {c.status.upper()}", fg=color, bold=True)
+    for r in c.reasons:
+        typer.echo(f"  - {r}")
+    for k, v in c.evidence.items():
+        typer.echo(f"  {k:<40} {v}")
+
+
+@app.command("loop")
+def loop_cmd(deployment: str = typer.Option(..., help="id printed by `predlab certify`"),
+             interval_minutes: float = 60.0, once: bool = False,
+             cycles: int = typer.Option(0, help="stop after N cycles (0 = run until stopped)")):
+    """Autonomous paper-trading research loop for one certified deployment."""
+    from datetime import timedelta
+
+    from predlab.loop.collect import make_collect
+    from predlab.loop.runner import LoopConfig, run_cycle, run_forever
+
+    s = get_settings()
+    sim = make_engine(s.sim_db_url)
+    init_sim_db(sim)
+    eng = _market_engine()
+    interval = timedelta(minutes=interval_minutes)
+    cfg = LoopConfig(deployment)
+    collect = make_collect(eng, s, interval=interval)
+    if once:
+        out = run_cycle(eng, sim, cfg, collect=collect)
+        typer.echo(json.dumps({k: out.get(k) for k in ("status", "registry_status",
+                                                        "new_forecasts", "alerts", "paper",
+                                                        "gate", "error")},
+                              indent=2, default=str))
+        return
+    typer.echo(f"looping every {interval_minutes:g} min; Ctrl+C to stop")
+    run_forever(eng, sim, cfg, interval=interval, collect=collect,
+                max_cycles=cycles or None)
+
+
+@app.command("paper-status")
+def paper_status():
+    """Every certified deployment with its gate evidence (holdout + forward paper record)."""
+    from sqlalchemy import select as sel
+
+    from predlab.db.schema import model_registry
+
+    s = get_settings()
+    sim = make_engine(s.sim_db_url)
+    init_sim_db(sim)
+    with sim.connect() as c:
+        rows = c.execute(sel(model_registry)).mappings().all()
+    if not rows:
+        typer.echo("no certified deployments (run `predlab certify`)")
+    for r in rows:
+        g = (r["validation_json"] or {}).get("gate", {})
+        typer.secho(f"{r['model_version']}  [{r['status']}]", bold=True)
+        for k in ("holdout_brier_diff_vs_market", "holdout_brier_diff_vs_market_ci_high",
+                  "holdout_net_pnl", "holdout_net_pnl_ci_low", "ci_level", "shrink_kappa",
+                  "paper_days", "paper_forecasts", "paper_resolved", "paper_net_pnl",
+                  "paper_brier_diff_vs_market", "paper_degradation_alerts", "paper_updated"):
+            typer.echo(f"  {k:<40} {g.get(k)}")
+        for reason in (r["validation_json"] or {}).get("reasons", []):
+            typer.echo(f"  rejected because: {reason}")
 
 
 if __name__ == "__main__":

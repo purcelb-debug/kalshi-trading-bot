@@ -61,11 +61,15 @@ def _to_ts(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, utc=True)
 
 
-def load_markets(engine: Engine, *, source=None, category=None, series=None) -> pd.DataFrame:
-    """Settled binary markets with their latest yes/no outcome and revision flag."""
-    latest = (select(outcomes.c.ticker, func.max(outcomes.c.recorded_at).label("rec"),
-                     func.max(outcomes.c.revised).label("revised"))
-              .group_by(outcomes.c.ticker).subquery())
+def load_markets(engine: Engine, *, source=None, category=None, series=None,
+                 as_of=None) -> pd.DataFrame:
+    """Settled binary markets with their latest yes/no outcome and revision flag.
+    With ``as_of``, only outcomes recorded by then count (replay / forward use)."""
+    lq = select(outcomes.c.ticker, func.max(outcomes.c.recorded_at).label("rec"),
+                func.max(outcomes.c.revised).label("revised"))
+    if as_of is not None:
+        lq = lq.where(outcomes.c.recorded_at <= pd.Timestamp(as_of).to_pydatetime())
+    latest = lq.group_by(outcomes.c.ticker).subquery()
     q = (select(mkt_markets.c.ticker, mkt_markets.c.source, mkt_markets.c.category,
                 mkt_markets.c.series_ticker, mkt_markets.c.event_ticker, mkt_markets.c.open_time,
                 mkt_markets.c.close_time, mkt_markets.c.expiration_time,
@@ -318,8 +322,8 @@ FEATURE_SETS = {"market": _market_state, "per_market_obs": _per_market_obs, "wea
 def build_dataset(engine: Engine, *, source=None, category=None, series=None,
                   horizon: timedelta = timedelta(hours=6),
                   feature_sets=("market", "per_market_obs", "weather", "economics"),
-                  use_market_features: bool = True, since=None) -> Dataset:
-    base = load_markets(engine, source=source, category=category, series=series)
+                  use_market_features: bool = True, since=None, as_of=None) -> Dataset:
+    base = load_markets(engine, source=source, category=category, series=series, as_of=as_of)
     if since is not None and not base.empty:
         base = base[base["close_time"] >= pd.Timestamp(since)].reset_index(drop=True)
     if base.empty:
@@ -327,9 +331,64 @@ def build_dataset(engine: Engine, *, source=None, category=None, series=None,
     base["decision_ts"] = base["close_time"] - horizon
     early = base["open_time"].notna() & (base["decision_ts"] < base["open_time"])
     base.loc[early, "decision_ts"] = base.loc[early, "open_time"]
+    base["_early"] = early   # carried as a column so it survives the sort below
     base["label_ts"] = base["expiration_time"].fillna(base["close_time"])
+    if as_of is not None:
+        base["label_ts"] = base["label_ts"].clip(upper=pd.Timestamp(as_of))
     base = base.sort_values(["decision_ts", "ticker"]).reset_index(drop=True)
+    y = (base["result"] == "yes").to_numpy(dtype=float)
+    return _assemble(engine, base, base.pop("_early"), feature_sets, use_market_features, y)
 
+
+def load_open_markets(engine: Engine, *, series=None, as_of) -> pd.DataFrame:
+    """Binary markets open at ``as_of`` (open_time <= as_of < close_time), whatever their
+    stored status says, so the same query serves live use and historical replay."""
+    ts = pd.Timestamp(as_of).to_pydatetime()
+    q = (select(mkt_markets.c.ticker, mkt_markets.c.source, mkt_markets.c.category,
+                mkt_markets.c.series_ticker, mkt_markets.c.event_ticker, mkt_markets.c.open_time,
+                mkt_markets.c.close_time, mkt_markets.c.expiration_time,
+                mkt_markets.c.strike_type, mkt_markets.c.floor_strike, mkt_markets.c.cap_strike)
+         .where(mkt_markets.c.open_time <= ts, mkt_markets.c.close_time > ts))
+    if series is not None:
+        q = q.where(mkt_markets.c.series_ticker.in_(series) if isinstance(
+            series, (list, tuple, set)) else mkt_markets.c.series_ticker == series)
+    with engine.connect() as c:
+        df = pd.DataFrame(c.execute(q).mappings().all())
+    if df.empty:
+        return df
+    for col in ("open_time", "close_time", "expiration_time"):
+        df[col] = _to_ts(df[col])
+    return df
+
+
+def build_live_dataset(engine: Engine, *, series, as_of, feature_names: list[str],
+                       min_to_close: timedelta, max_to_close: timedelta,
+                       feature_sets=("market", "per_market_obs", "weather", "economics")
+                       ) -> Dataset:
+    """Features for open markets whose time to close is in [min_to_close, max_to_close],
+    with decision time = ``as_of``. Columns are aligned to a trained model's
+    ``feature_names``; ``y`` is NaN because the outcome is unknown."""
+    base = load_open_markets(engine, series=series, as_of=as_of)
+    now = pd.Timestamp(as_of)
+    if not base.empty:
+        ttc = base["close_time"] - now
+        base = base[(ttc >= min_to_close) & (ttc <= max_to_close)].reset_index(drop=True)
+    if base.empty:
+        return Dataset(pd.DataFrame(columns=feature_names), np.array([]), pd.DataFrame(
+            columns=["ticker", "decision_ts", "market_mid", "dq_flags"]), list(feature_names))
+    base["decision_ts"] = now
+    base["label_ts"] = base["expiration_time"].fillna(base["close_time"])
+    base["revised"] = False
+    base = base.sort_values("ticker").reset_index(drop=True)
+    ds = _assemble(engine, base, pd.Series(False, index=base.index), feature_sets, True,
+                   np.full(len(base), np.nan))
+    ds.X = ds.X.reindex(columns=feature_names)
+    ds.feature_names = list(feature_names)
+    return ds
+
+
+def _assemble(engine: Engine, base: pd.DataFrame, early: pd.Series, feature_sets,
+              use_market_features: bool, y: np.ndarray) -> Dataset:
     feats = base[["ticker"]].copy()
     ts_cols = []
     for name in feature_sets:
@@ -376,5 +435,4 @@ def build_dataset(engine: Engine, *, source=None, category=None, series=None,
     meta["cluster"] = meta["event_ticker"].fillna(meta["ticker"])
     meta["dq_flags"] = flags
     X = feats[feature_cols].astype(float).reset_index(drop=True)
-    y = (base["result"] == "yes").to_numpy(dtype=float)
     return Dataset(X, y, meta, feature_cols)

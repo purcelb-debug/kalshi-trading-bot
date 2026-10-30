@@ -33,12 +33,17 @@ def _last_hash(conn) -> str:
 
 
 def record_forecasts(engine: Engine, items: list[Forecast],
-                     market_ref: dict[str, float] | None = None) -> int:
-    """Append forecasts in one transaction. ``created_ts`` is the wall-clock write time."""
+                     market_ref: dict[str, float] | None = None, created_ts=None) -> int:
+    """Append forecasts in one transaction. ``created_ts`` is the wall-clock write time,
+    or an explicit earlier decision time (historical replay); never a future time."""
     market_ref = market_ref or {}
     with engine.begin() as conn:
         prev = _last_hash(conn)
         now = utcnow()
+        if created_ts is not None:
+            if to_utc(created_ts) > now:
+                raise ValueError("created_ts is in the future")
+            now = to_utc(created_ts)
         for f in items:
             if to_utc(f.input_max_ts) > now:
                 raise ValueError(f"forecast for {f.ticker} uses inputs from the future")
