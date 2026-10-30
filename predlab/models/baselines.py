@@ -187,6 +187,8 @@ class LightGBM(Forecaster):
 
     def fit(self, ds: Dataset):
         from lightgbm import LGBMClassifier
+        if ds.X.shape[1] == 0:
+            raise ValueError("lightgbm needs at least one feature")
         self.features_ = list(ds.X.columns)
         self.model_ = LGBMClassifier(**self.kw).fit(ds.X, ds.y)
         return self

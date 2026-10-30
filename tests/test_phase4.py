@@ -218,3 +218,75 @@ def test_multiple_testing_uses_bonferroni_level(sports):
     assert set(out) == {"logistic_l2", "logistic"}
     assert all(v["level"] == pytest.approx(1 - 0.05 / 2) for v in out.values())
     assert all(v["low"] <= v["diff"] <= v["high"] for v in out.values())
+
+
+# ---------------------------------------------------------------- uncertainty-aware sizing
+
+def test_shrink_to_market_math():
+    from predlab.backtest.engine import shrink_to_market
+    assert shrink_to_market(0.8, 0.5, 1.0) == 0.8
+    assert shrink_to_market(0.8, 0.5, 0.0) == pytest.approx(0.5)
+    half = shrink_to_market(0.8, 0.5, 0.5)            # logit midpoint of 0.5 and 0.8
+    assert half == pytest.approx(1 / (1 + (0.2 / 0.8) ** 0.5))
+    assert shrink_to_market(0.8, None, 0.5) == 0.8     # no market view -> unchanged
+
+
+def test_entry_band_blocks_long_shots():
+    T0 = pd.Timestamp("2026-01-05 12:00", tz="UTC")
+
+    class Cheap:
+        def quote(self, ticker, ts, cfg):
+            return Quote(T0, "book", [(0.03, 500.0)], [(0.98, 500.0)], 0.02, 0.97), ""
+
+    sig = pd.DataFrame({"ticker": ["A"], "decision_ts": [T0], "p": [0.30], "cluster": ["E"],
+                        "category": ["x"], "series_ticker": ["S"]})
+    res = pd.DataFrame({"ticker": ["A"], "resolve_ts": [T0 + timedelta(days=1)], "result": ["no"]})
+    loose = run_backtest(sig, res, Cheap(), strategy=StrategyConfig(shrink=1.0, min_entry_price=0.0))
+    guarded = run_backtest(sig, res, Cheap(), strategy=StrategyConfig(shrink=1.0))
+    assert loose.summary["n_fills"] == 1 and guarded.summary["n_fills"] == 0
+
+
+def test_guard_limits_damage_from_forecast_noise(syn):
+    """Acceptance test for the real-data failure mode (Phase 4): a model that is close to
+    the market plus noise. Every apparent edge is noise, so trading should be minimized.
+    The guarded strategy must lose less and trade less than the unguarded one."""
+    ds = build_dataset(syn, source="synthetic", category="sports")
+    sig, res, md = _oracle_run(syn, "sports")
+    mid = ds.meta.set_index("ticker").loc[sig["ticker"], "market_mid"].fillna(0.5).to_numpy()
+    rng = np.random.default_rng(3)
+    lg = np.log(mid / (1 - mid))
+    noisy = sig.assign(p=1 / (1 + np.exp(-(lg + rng.normal(0, 1.0, len(sig))))))
+    # drawdown halt off in both, so this isolates the shrink + price-band guard
+    raw = run_backtest(noisy, res, md, strategy=StrategyConfig(
+        shrink=1.0, min_entry_price=0.0, max_entry_price=1.0, drawdown_halt=None))
+    guarded = run_backtest(noisy, res, md, strategy=StrategyConfig(drawdown_halt=None))
+    assert guarded.summary["net_pnl"] > raw.summary["net_pnl"]
+    assert guarded.summary["n_fills"] < raw.summary["n_fills"]
+
+
+def test_learned_shrink_trusts_signal_and_ignores_noise(syn):
+    """kappa ~ high for a model whose disagreement with the market is informative (truth),
+    ~0 for one whose disagreement is pure noise; fold 0 always trusts the market."""
+    from predlab.backtest.shrinkage import learned_shrink
+    from predlab.evaluation.splits import holdout_split, walk_forward
+    ds = build_dataset(syn, source="synthetic", category="sports")
+    dev, _, _ = holdout_split(ds, 0.2)
+    folds = walk_forward(ds, dev, n_folds=4)
+    tp = truth(syn)
+    rng = np.random.default_rng(0)
+    rows = []
+    for f in folds:
+        m = ds.meta.iloc[f.valid]
+        mid = m["market_mid"].to_numpy()
+        noise = 1 / (1 + np.exp(-(np.log(mid / (1 - mid)) + rng.normal(0, 1, len(m)))))
+        rows.append(pd.DataFrame({"ticker": m["ticker"], "fold": f.index, "y": ds.y[f.valid],
+                                  "p_truth": m["ticker"].map(tp).to_numpy(), "p_noise": noise}))
+    preds = pd.concat(rows, ignore_index=True)
+    _, k_truth = learned_shrink(preds.assign(p=preds["p_truth"]), ds.meta, folds)
+    shrunk, k_noise = learned_shrink(preds.assign(p=preds["p_noise"]), ds.meta, folds)
+    assert k_truth[0] == 0.0 and k_noise[0] == 0.0
+    assert min(list(k_truth.values())[1:]) > 0.5
+    assert max(list(k_noise.values())[1:]) < 0.25
+    first = preds["fold"] == 0      # fold 0 forecasts collapse to the market mid
+    mids = ds.meta.set_index("ticker").loc[preds.loc[first, "ticker"], "market_mid"].to_numpy()
+    assert np.allclose(shrunk[first].to_numpy(), mids, atol=1e-6)

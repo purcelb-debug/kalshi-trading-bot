@@ -5,6 +5,7 @@ and order books. No credentials are loaded and no authenticated endpoint is reac
 (see predlab.data.http.KALSHI_READ_PATHS).
 """
 
+from collections.abc import Callable
 from datetime import datetime
 
 from sqlalchemy import Engine, select
@@ -28,6 +29,7 @@ from predlab.timeutil import to_utc, utcnow
 
 SOURCE = "kalshi"
 PERIODS = {1, 60, 1440}  # candlestick intervals Kalshi accepts, minutes
+MARKET_BATCH = 5000      # markets written per batch while paginating
 
 
 def _num(x) -> float | None:
@@ -180,10 +182,16 @@ class KalshiCollector:
     async def collect_markets(self, stats: RunStats, *, series_ticker: str | None = None,
                               event_ticker: str | None = None, status: str | None = None,
                               category: str | None = None, min_close_ts: int | None = None,
-                              max_close_ts: int | None = None,
-                              historical: bool = False) -> list[dict]:
+                              max_close_ts: int | None = None, historical: bool = False,
+                              keep: Callable[[dict], bool] | None = None,
+                              max_markets: int | None = None,
+                              batch_size: int = MARKET_BATCH) -> list[dict]:
         """Live tier by default; ``historical=True`` reads the archive tier, which holds
-        settled markets older than the cutoff and accepts a single ticker filter only."""
+        settled markets older than the cutoff and accepts a single ticker filter only.
+
+        Markets are written in batches as pages arrive, so memory stays flat however large
+        the series is. Only rows passing ``keep`` are returned; ``max_markets`` stops the
+        download after that many markets and records a data-quality note saying so."""
         now = utcnow()
         params: dict = {"limit": 1000}
         filters = (("series_ticker", series_ticker), ("event_ticker", event_ticker))
@@ -196,13 +204,30 @@ class KalshiCollector:
             if v is not None:
                 params[k] = v
         path = "/historical/markets" if historical else "/markets"
-        rows = [norm_market(m, now, series_ticker, category)
-                async for m in self.client.paginate(path, "markets", params)]
-        good, issues = split_valid(rows, check_market)
-        persist_issues(self.engine, stats, issues)
-        stats.add("mkt_markets", upsert(self.engine, mkt_markets, good, ["ticker"]))
-        stats.add("outcomes", self._record_outcomes(good, now))
-        return good
+        kept: list[dict] = []
+        batch: list[dict] = []
+        seen = 0
+
+        def flush() -> None:
+            good, issues = split_valid(batch, check_market)
+            persist_issues(self.engine, stats, issues)
+            stats.add("mkt_markets", upsert(self.engine, mkt_markets, good, ["ticker"]))
+            stats.add("outcomes", self._record_outcomes(good, now))
+            kept.extend(m for m in good if keep is None or keep(m))
+            batch.clear()
+
+        async for m in self.client.paginate(path, "markets", params):
+            batch.append(norm_market(m, now, series_ticker, category))
+            seen += 1
+            if len(batch) >= batch_size:
+                flush()
+            if max_markets is not None and seen >= max_markets:
+                stats.warnings.append(
+                    f"{path} {series_ticker or event_ticker}: stopped at max_markets={max_markets}")
+                break
+        if batch:
+            flush()
+        return kept
 
     def _record_outcomes(self, markets: list[dict], now: datetime) -> int:
         """Append an outcome row only when a binary result is new or has changed."""
@@ -212,10 +237,12 @@ class KalshiCollector:
         tickers = [m["ticker"] for m in resolved]
         latest: dict[str, str] = {}
         with self.engine.connect() as conn:
-            q = (select(outcomes.c.ticker, outcomes.c.result, outcomes.c.recorded_at)
-                 .where(outcomes.c.ticker.in_(tickers)).order_by(outcomes.c.recorded_at))
-            for r in conn.execute(q):
-                latest[r.ticker] = r.result
+            for i in range(0, len(tickers), 900):   # stay under SQLite's bound-variable limit
+                q = (select(outcomes.c.ticker, outcomes.c.result, outcomes.c.recorded_at)
+                     .where(outcomes.c.ticker.in_(tickers[i:i + 900]))
+                     .order_by(outcomes.c.recorded_at))
+                for r in conn.execute(q):
+                    latest[r.ticker] = r.result
         new = [{
             "ticker": m["ticker"], "recorded_at": now, "result": m["result"],
             "resolved_ts": m.get("expiration_time") or m.get("close_time"),
@@ -275,7 +302,9 @@ class KalshiCollector:
     async def collect_series_bundle(self, series_ticker: str, *, status: str | None = None,
                                     with_trades: bool = False, with_candles: bool = False,
                                     with_orderbooks: bool = False, include_archive: bool = True,
-                                    candle_period: int = 60) -> RunStats:
+                                    candle_period: int = 60,
+                                    since: datetime | None = None,
+                                    max_markets: int | None = None) -> RunStats:
         """Series -> events -> markets (-> trades / candles / books) in one tracked run.
 
         With ``include_archive`` (and a status of settled or unspecified), markets that
@@ -285,16 +314,24 @@ class KalshiCollector:
         async with tracked_run(self.engine, SOURCE) as stats:
             series = await self.collect_series(series_ticker, stats)
             await self.collect_events(series_ticker, stats, status=None)
+            # Metadata and outcomes are stored for every market; only markets that close
+            # after ``since`` are kept in memory for the heavy trade/candle/book pass.
+            def recent(m: dict) -> bool:
+                return since is None or (m["close_time"] is not None and m["close_time"] >= since)
+
             markets = await self.collect_markets(stats, series_ticker=series_ticker, status=status,
-                                                 category=series["category"])
+                                                 category=series["category"], keep=recent,
+                                                 max_markets=max_markets)
             archived: set[str] = set()
             cut = {}
             if include_archive and status in (None, "settled"):
                 cut = await self.get_cutoffs()
                 old = await self.collect_markets(stats, series_ticker=series_ticker,
-                                                 category=series["category"], historical=True)
+                                                 category=series["category"], historical=True,
+                                                 keep=recent, max_markets=max_markets)
                 archived = {m["ticker"] for m in old}
-                markets += [m for m in old if m["ticker"] not in {x["ticker"] for x in markets}]
+                live = {x["ticker"] for x in markets}
+                markets += [m for m in old if m["ticker"] not in live]
             trade_cut = cut.get("trades_created_ts")
             for m in markets:
                 if with_trades:

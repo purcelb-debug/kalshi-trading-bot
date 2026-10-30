@@ -49,9 +49,14 @@ def ingest_kalshi(
     series: list[str] = typer.Option(..., "--series", help="Kalshi series ticker, e.g. KXHIGHNY"),
     status: str = typer.Option("settled", help="unopened|open|closed|settled, or '' for all"),
     trades: bool = False, candles: bool = False, books: bool = False,
+    since: str = typer.Option("", help="only fetch trades/candles/books for markets closing "
+                                       "on or after this date (YYYY-MM-DD)"),
+    max_markets: int = typer.Option(20000, help="stop each tier's market download after this "
+                                                "many markets (0 = no cap)"),
 ):
     """Download public Kalshi series/events/markets (optionally trades, candles, books)."""
     from predlab.data.collectors.kalshi import KalshiCollector, make_client
+    from predlab.timeutil import to_utc
 
     eng = _market_engine()
 
@@ -61,9 +66,12 @@ def ingest_kalshi(
             for s in series:
                 st = await col.collect_series_bundle(
                     s, status=status or None, with_trades=trades, with_candles=candles,
-                    with_orderbooks=books)
+                    with_orderbooks=books, since=to_utc(since) if since else None,
+                    max_markets=max_markets or None)
                 typer.echo(f"{s}: {st.rows} (issues recorded: {st.issues}, "
                            f"requests: {client.requests_made})")
+                for w in st.warnings:
+                    typer.echo(f"  warning: {w}")
 
     asyncio.run(run())
 
@@ -146,14 +154,16 @@ def health():
             typer.echo(f"  {t.name:<26} {conn.execute(select(func.count()).select_from(t)).scalar()}")
 
 
-def _dataset(source, category, series, horizon_hours, no_market_features):
+def _dataset(source, category, series, horizon_hours, no_market_features, since=""):
     from datetime import timedelta
 
     from predlab.features.pointintime import build_dataset
+    from predlab.timeutil import to_utc
 
     return build_dataset(_market_engine(), source=source or None, category=category or None,
                          series=series or None, horizon=timedelta(hours=horizon_hours),
-                         use_market_features=not no_market_features)
+                         use_market_features=not no_market_features,
+                         since=to_utc(since) if since else None)
 
 
 def _factories(models: str):
@@ -173,7 +183,8 @@ def _factories(models: str):
 def evaluate(source: str = "", category: str = "", series: str = "",
              models: str = "all", folds: int = 5, holdout_frac: float = 0.2,
              horizon_hours: float = 6.0, embargo_hours: float = 0.0, min_train: int = 50,
-             no_market_features: bool = False, n_boot: int = 500):
+             no_market_features: bool = False, n_boot: int = 500,
+             since: str = typer.Option("", help="only markets closing on/after YYYY-MM-DD")):
     """Walk-forward evaluation (the holdout is carved off and NOT touched)."""
     import json
     from datetime import timedelta
@@ -182,7 +193,7 @@ def evaluate(source: str = "", category: str = "", series: str = "",
     from predlab.evaluation.walkforward import run_walk_forward
     from predlab.timeutil import utcnow
 
-    ds = _dataset(source, category, series, horizon_hours, no_market_features)
+    ds = _dataset(source, category, series, horizon_hours, no_market_features, since)
     res = run_walk_forward(ds, _factories(models), n_folds=folds, holdout_frac=holdout_frac,
                            min_train=min_train, embargo=timedelta(hours=embargo_hours),
                            n_boot=n_boot)
@@ -194,8 +205,9 @@ def evaluate(source: str = "", category: str = "", series: str = "",
                "the difference is not distinguishable.")
     if res.decided_share > 0.5:
         typer.secho(f"WARNING: {res.decided_share:.0%} of markets were priced <=3c or >=97c at "
-                    "decision time, so most outcomes were already effectively known. Use a "
-                    "longer --horizon-hours (e.g. 30 for daily weather) before reading any edge.",
+                    "decision time, so most outcomes were already effectively known. Either the "
+                    "horizon is too short (try a longer --horizon-hours, e.g. 30 for daily "
+                    "weather) or most strikes are far from the money (normal for strike ladders).",
                     fg=typer.colors.RED)
     if res.market_coverage < 0.95:
         typer.secho(f"WARNING: only {res.market_coverage:.0%} of validated markets have a "
@@ -250,7 +262,9 @@ def backtest(model: str = typer.Option(...), source: str = "", category: str = "
              no_market_features: bool = False, initial_cash: float = 1000.0,
              min_edge: float = 0.03, kelly_fraction: float = 0.25,
              max_market_frac: float = 0.02, slippage: float = 0.01,
-             sensitivity: bool = True):
+             sensitivity: bool = True,
+             shrink: str = typer.Option("learned", help="'learned' (per-fold kappa from "
+                                        "earlier folds) or a fixed number in [0, 1]")):
     """Paper-trade a model's out-of-sample walk-forward forecasts (holdout untouched)."""
     import json
     from datetime import timedelta
@@ -275,10 +289,13 @@ def backtest(model: str = typer.Option(...), source: str = "", category: str = "
     ds = _dataset(source, category, series, horizon_hours, no_market_features)
     wf = run_walk_forward(ds, _factories(model), n_folds=folds, holdout_frac=holdout_frac,
                           min_train=min_train, embargo=timedelta(hours=embargo_hours), n_boot=200)
-    sig, res = signals_from_walk_forward(wf, model, ds)
+    sig, res = signals_from_walk_forward(wf, model, ds, learned_shrink=shrink == "learned")
     md = MarketData(eng, sig["ticker"])
     strat = StrategyConfig(initial_cash=initial_cash, min_edge=min_edge,
-                           kelly_fraction=kelly_fraction, max_market_frac=max_market_frac)
+                           kelly_fraction=kelly_fraction, max_market_frac=max_market_frac,
+                           shrink=1.0 if shrink == "learned" else float(shrink))
+    if "kappas" in sig.attrs:
+        typer.echo(f"learned kappa per fold (trust in model vs market): {sig.attrs['kappas']}")
 
     def run(fee_stress, slip):
         return run_backtest(sig, res, md, strategy=strat, execution=ExecConfig(slippage=slip),
@@ -317,7 +334,9 @@ def backtest(model: str = typer.Option(...), source: str = "", category: str = "
 def compare_categories_cmd(source: str = "", series: str = "",
                            models: str = "frequency_bayes,logistic_l2,lightgbm,market_platt",
                            folds: int = 5, horizon_hours: float = 6.0, min_rows: int = 100,
-                           n_boot: int = 300):
+                           n_boot: int = 300,
+                           since: str = typer.Option("", help="only markets closing on/after "
+                                                              "YYYY-MM-DD (all categories)")):
     """Rank categories by forecasting quality and reliability (not a betting ranking)."""
     import json
     from datetime import timedelta
@@ -326,11 +345,12 @@ def compare_categories_cmd(source: str = "", series: str = "",
     import pandas as pd
 
     from predlab.evaluation.category_rank import DISCLAIMER, compare_categories
-    from predlab.timeutil import utcnow
+    from predlab.timeutil import to_utc, utcnow
 
     table, skipped = compare_categories(
         _market_engine(), _factories(models), source=source or None, series=series or None,
-        horizon=timedelta(hours=horizon_hours), n_folds=folds, min_rows=min_rows, n_boot=n_boot)
+        horizon=timedelta(hours=horizon_hours), n_folds=folds, min_rows=min_rows, n_boot=n_boot,
+        since=to_utc(since) if since else None)
     typer.secho(DISCLAIMER, fg=typer.colors.YELLOW)
     if table.empty:
         typer.echo(f"no category had enough data: {skipped}")
@@ -354,7 +374,8 @@ def compare_categories_cmd(source: str = "", series: str = "",
 def stress_cmd(model: str = typer.Option(...), source: str = "", category: str = "",
                series: str = "", folds: int = 5, horizon_hours: float = 6.0,
                no_market_features: bool = False, initial_cash: float = 1000.0,
-               min_edge: float = 0.03, probe: bool = True):
+               min_edge: float = 0.03, probe: bool = True,
+               shrink: str = typer.Option("learned", help="'learned' or a fixed number")):
     """Stress-test a model's out-of-sample paper trading, plus overfitting probes."""
     import json
     from pathlib import Path
@@ -372,9 +393,13 @@ def stress_cmd(model: str = typer.Option(...), source: str = "", category: str =
     ds = _dataset(source, category, series, horizon_hours, no_market_features)
     facs = _factories(model)
     wf = run_walk_forward(ds, facs, n_folds=folds, n_boot=200)
-    sig, res = signals_from_walk_forward(wf, model, ds)
+    sig, res = signals_from_walk_forward(wf, model, ds, learned_shrink=shrink == "learned")
+    if "kappas" in sig.attrs:
+        typer.echo(f"learned kappa per fold: {sig.attrs['kappas']}")
     table = run_stress_suite(sig, res, MarketData(eng, sig["ticker"]),
-                             strategy=StrategyConfig(initial_cash=initial_cash, min_edge=min_edge),
+                             strategy=StrategyConfig(
+                                 initial_cash=initial_cash, min_edge=min_edge,
+                                 shrink=1.0 if shrink == "learned" else float(shrink)),
                              fee_for=fee_schedules(eng),
                              fee_for_stress=lambda m: fee_schedules(eng, m))
     typer.secho(f"{BANNER}  stress suite for {wf.versions.get(model)}", bold=True)

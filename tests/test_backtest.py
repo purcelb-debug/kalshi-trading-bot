@@ -197,7 +197,8 @@ def test_settlement_cash_is_available_to_same_time_decision(md_engine):
     # M1 spends nearly all cash (23 @ 0.40 + 0.39 fee leaves 0.41 < one M2 contract).
     # M1 resolves at the exact timestamp of the M2 decision.
     strat = StrategyConfig(initial_cash=10, min_edge=0.02, max_market_frac=1.0,
-                           max_cluster_frac=1.0, max_total_exposure_frac=1.0, kelly_fraction=3.0)
+                           max_cluster_frac=1.0, max_total_exposure_frac=1.0, kelly_fraction=3.0,
+                           shrink=1.0, drawdown_halt=None)
     when = [T0 + timedelta(days=1), T0 + timedelta(days=5)]
     win = run_backtest(sig, pd.DataFrame({"ticker": ["M1", "M2"], "resolve_ts": when,
                                           "result": ["yes", "no"]}), md, strategy=strat)
@@ -285,3 +286,20 @@ def test_walk_forward_signals_and_persistence(syn, sim_engine):
                          .where(sim_fills.c.run_id == run_id)).scalar() == len(out.fills)
     assert out.summary["banner"] == "PAPER TRADING — NOT REAL MONEY"
     assert to_utc(out.equity["ts"].max()) <= to_utc(res["resolve_ts"].max())
+
+
+def test_drawdown_halt_stops_new_positions(md_engine):
+    """After equity drops 20% below its peak, no new positions are opened."""
+    sig, md = tiny_world(md_engine)
+    # Same edge signal on M1 then M2; M1 loses big enough to trip a 20% halt.
+    strat = StrategyConfig(initial_cash=100, min_edge=0.02, max_market_frac=1.0,
+                           max_cluster_frac=1.0, max_total_exposure_frac=1.0,
+                           kelly_fraction=3.0, shrink=1.0, drawdown_halt=0.20)
+    res = pd.DataFrame({"ticker": ["M1", "M2"], "resolve_ts": [T0 + timedelta(hours=1),
+                        T0 + timedelta(days=5)], "result": ["no", "yes"]})
+    out = run_backtest(sig, res, md, strategy=strat)
+    assert set(out.fills["ticker"]) == {"M1"}
+    assert out.summary["rejections"].get("drawdown_halt") == 1 and out.summary["halted_at"]
+    free = run_backtest(sig, res, md, strategy=StrategyConfig(
+        **{**strat.__dict__, "drawdown_halt": None}))
+    assert "M2" in set(free.fills["ticker"])

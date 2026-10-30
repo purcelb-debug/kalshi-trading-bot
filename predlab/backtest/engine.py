@@ -43,6 +43,16 @@ class StrategyConfig:
     max_cluster_frac: float = 0.05     # max cost in one event (correlated markets)
     max_total_exposure_frac: float = 0.5
     allow_no: bool = True
+    #: Forecast-uncertainty guard. In log-odds space the forecast is pulled toward the
+    #: market mid seen at decision time: logit(p') = logit(m) + shrink * (logit(p) - logit(m)).
+    #: 1.0 trusts the model fully, 0.0 trusts the market fully.
+    shrink: float = 0.5
+    #: Never buy contracts priced outside this band (noisy long-shot / near-certain region).
+    min_entry_price: float = 0.05
+    max_entry_price: float = 0.95
+    #: Stop opening new positions for the rest of the run once equity falls this far below
+    #: its running peak (open positions still settle). None disables the halt.
+    drawdown_halt: float | None = 0.20
 
 
 @dataclass
@@ -54,6 +64,22 @@ class BacktestResult:
     positions: pd.DataFrame
     equity: pd.DataFrame
     config: dict = field(default_factory=dict)
+
+
+def quote_mid(quote) -> float | None:
+    """Mid of the best YES bid and YES ask (= 1 - best NO bid), if both exist."""
+    if quote.yes_bid is None or quote.no_bid is None:
+        return None
+    bid, ask = quote.yes_bid, 1 - quote.no_bid
+    return (bid + ask) / 2 if 0 < bid < ask < 1 else None
+
+
+def shrink_to_market(p: float, mid: float | None, shrink: float) -> float:
+    if mid is None or shrink >= 1.0:
+        return p
+    lp = math.log(min(max(p, 1e-4), 1 - 1e-4) / (1 - min(max(p, 1e-4), 1 - 1e-4)))
+    lm = math.log(mid / (1 - mid))
+    return 1 / (1 + math.exp(-(lm + shrink * (lp - lm))))
 
 
 def _ev(p_side: float, price: float, fees: FeeSchedule) -> float:
@@ -86,6 +112,8 @@ def run_backtest(signals: pd.DataFrame, resolutions: pd.DataFrame, market: Marke
     rejects: Counter = Counter()
     order_id = 0
     last_ts = None
+    peak = pf.equity
+    halted_at = None
     for ts, _, kind, r in events:
         if last_ts is not None and ts != last_ts:
             pf.snapshot(last_ts)
@@ -95,6 +123,12 @@ def run_backtest(signals: pd.DataFrame, resolutions: pd.DataFrame, market: Marke
             for (t, _side), pos in pf.positions.items():
                 if t == r.ticker:
                     cluster_cost[pos.cluster] -= pos.cost
+            continue
+        peak = max(peak, pf.equity)
+        if halted_at is None and strategy.drawdown_halt is not None and                 pf.equity < peak * (1 - strategy.drawdown_halt):
+            halted_at = ts
+        if halted_at is not None:
+            rejects["drawdown_halt"] += 1
             continue
         fees = fee_for.get(r.series_ticker, default_fees)
         # The decision (edge, size, limit) uses what we *see*; the fill uses what the
@@ -107,11 +141,13 @@ def run_backtest(signals: pd.DataFrame, resolutions: pd.DataFrame, market: Marke
             continue
         slip = execution.slippage if quote.source != "book" else 0.0
         best = None
-        for side, q_side, asks in (("yes", r.p, quote.yes_asks), ("no", 1 - r.p, quote.no_asks)):
+        p_used = shrink_to_market(r.p, quote_mid(quote), strategy.shrink)
+        for side, q_side, asks in (("yes", p_used, quote.yes_asks),
+                                   ("no", 1 - p_used, quote.no_asks)):
             if side == "no" and not strategy.allow_no or not asks:
                 continue
             a = asks[0][0] + slip
-            if not 0 < a < 1:
+            if not strategy.min_entry_price <= a <= strategy.max_entry_price:
                 continue
             ev = _ev(q_side, a, fees)
             if best is None or ev > best[2]:
@@ -145,7 +181,8 @@ def run_backtest(signals: pd.DataFrame, resolutions: pd.DataFrame, market: Marke
         order_id += 1
         orders.append({"order_id": order_id, "ts": ts, "ticker": r.ticker, "side": side,
                        "limit_price": round(limit, 4), "qty_requested": qty,
-                       "qty_filled": fr.qty, "p_model": r.p, "ev_per_contract": round(ev, 4),
+                       "qty_filled": fr.qty, "p_model": r.p, "p_used": round(p_used, 4),
+                       "ev_per_contract": round(ev, 4),
                        "status": "filled" if fr.qty >= qty else ("partial" if fr.qty else "unfilled"),
                        "reason": fr.reason, "quote_source": quote.source})
         mark = exec_quote.yes_bid if side == "yes" else exec_quote.no_bid
@@ -163,7 +200,9 @@ def run_backtest(signals: pd.DataFrame, resolutions: pd.DataFrame, market: Marke
                           "liquidity_uncertain": fr.liquidity_uncertain})
     if last_ts is not None:
         pf.snapshot(last_ts)
-    return _result(pf, signals, resolutions, orders, fills, rejects, strategy, execution)
+    out = _result(pf, signals, resolutions, orders, fills, rejects, strategy, execution)
+    out.summary["halted_at"] = None if halted_at is None else str(halted_at)
+    return out
 
 
 def _max_drawdown(equity: pd.Series) -> float:
@@ -229,18 +268,33 @@ def _pnl_ci(settled: pd.DataFrame, n_boot: int = 2000, seed: int = 0):
 
 # ---------------------------------------------------------------- inputs and persistence
 
-def signals_from_walk_forward(result, model: str, ds) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Out-of-sample signals for one model, plus resolutions for those markets."""
-    pr = result.predictions[result.predictions["model"] == model][["ticker", "p"]]
+def signals_from_walk_forward(result, model: str, ds, *, learned_shrink: bool = False
+                              ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Out-of-sample signals for one model, plus resolutions for those markets.
+
+    With ``learned_shrink`` each fold's forecasts are pulled toward the market by a kappa
+    learned only from earlier folds (see predlab.backtest.shrinkage); the per-fold kappas
+    are stored in ``signals.attrs["kappas"]``.
+    """
+    pr = result.predictions[result.predictions["model"] == model][["ticker", "p", "fold", "y"]]
     if pr.empty:
         raise ValueError(f"no walk-forward predictions for model {model!r}")
+    kappas = None
+    if learned_shrink:
+        from predlab.backtest.shrinkage import learned_shrink as _learn
+        shrunk, kappas = _learn(pr, ds.meta, result.folds)
+        pr = pr.assign(p=shrunk)
+    pr = pr[["ticker", "p"]]
     meta = ds.meta.set_index("ticker")
     sig = pr.join(meta[["decision_ts", "cluster", "category", "series_ticker"]], on="ticker")
     y = pd.Series(ds.y, index=ds.meta["ticker"])
     res = pd.DataFrame({"ticker": sig["ticker"].to_numpy(),
                         "resolve_ts": meta.loc[sig["ticker"], "label_ts"].reset_index(drop=True),
                         "result": np.where(y.loc[sig["ticker"]].values == 1.0, "yes", "no")})
-    return sig.sort_values("decision_ts").reset_index(drop=True), res
+    sig = sig.sort_values("decision_ts").reset_index(drop=True)
+    if kappas is not None:
+        sig.attrs["kappas"] = kappas
+    return sig, res
 
 
 def fee_schedules(engine: Engine, stress: float = 1.0) -> dict[str, FeeSchedule]:

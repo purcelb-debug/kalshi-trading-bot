@@ -94,3 +94,50 @@
 ## Known limitations
 - Only categories with downloaded data can be compared on real markets. The real database has weather (KXHIGHNY) and economics (KXCPIYOY). Sports and public events are synthetic only.
 - Stress tests reuse the base run's signals. They don't retrain models under stressed data.
+
+## Follow-up fixes (after review, 2026-10-29)
+
+### 1. Uncertainty-aware sizing
+| Mechanism | What it does | File |
+|---|---|---|
+| Shrink to market | logit(p′) = logit(mid) + κ·(logit(p) − logit(mid)), using the mid seen at decision time | `predlab/backtest/engine.py` |
+| **Learned κ** (CLI default) | For fold k, κ is fit on earlier folds' out-of-sample predictions whose outcomes were already public: the coefficient on (logit p − logit mid) in a logistic regression of outcomes, clamped to [0, 1]. Fold 0 gets κ = 0 | `predlab/backtest/shrinkage.py` |
+| Entry price band | No buys below $0.05 or above $0.95 | engine |
+| **Drawdown halt** | No new positions once equity is 20% below its running peak | engine |
+| Executor | Same shrink and band (`EXECUTOR_SHRINK`, default 0.5); its daily loss stop is the live equivalent of the halt | `executor/runner.py` |
+
+Tests: κ > 0.5 for informative forecasts, κ < 0.25 for pure noise, and fold 0 forecasts collapse to the market mid. With "market + noise" forecasts, the shrink-and-band guard loses less and trades less. The drawdown halt blocks new positions after a 20% drop.
+
+**Real KXHIGHNY after the fixes** (learned κ per fold: 0, 1.0, 0.999, 0.954, 0.891, so the model's disagreements with the market are informative):
+
+| scenario | before | after |
+|---|---|---|
+| base | −$79.29, 304 fills | **−$60.69** [−$118.60, −$1.44], 54 fills |
+| forecast_noise_0.5 | −$846.00 (−85%) | **−$204.80 (−20.5%)**, stopped by the drawdown halt |
+
+- The strategy still loses: the forecasting edge doesn't cover costs.
+- Learned κ can't protect against a *sudden* drop in forecast quality, because it learns from history. The drawdown halt (and, live, the daily loss stop plus Phase 5 degradation alerts) is the defense there.
+
+### 2. FRED features for CPI markets
+- `econ_margin_last`: latest published YoY CPI (one decimal, as BLS reports it) vs the strike.
+- `econ_margin_proj`: a one-month-ahead projection using the known base effect.
+- `econ_yoy_mom`: the most recent change in the YoY rate.
+- These use **CPIAUCNS** (CPI-U, not seasonally adjusted), which the Kalshi rules settle on. A value counts as public **one day after** its FRED vintage date, because vintages have day resolution and BLS releases at 08:30 ET. That resolves Phase 1 assumption #4.
+- Legacy `CPIYOY-…-T8.0` tickers are parsed as "above 8.0%". Fixed a bug where a pandas `NaN` strike_type was treated as truthy.
+- The October 2025 CPI value is missing (the 2025 federal shutdown) and is handled as a gap.
+- **Result:** the feature is informative (outcome rate rises from 10% to 91% across margin bins), but the market prices it almost identically (mid rises from 12% to 92%). On 435 validated CPI markets, market Brier is 0.111 vs 0.168–0.172 for the FRED-feature models. **The CPI market is efficient against public CPI data.**
+
+### 2026-10-30: memory blow-up on large series (fixed)
+- KXINXU plus its legacy archive turned out to be ~845k markets. `collect_markets` held a
+  whole tier in memory before writing, and the run was killed when the machine ran low on RAM.
+- Fix: markets are now written in batches of 5,000 as pages arrive, only markets passing the
+  `since` filter are kept in memory for the candle/trade pass, and `ingest-kalshi
+  --max-markets` (default 20,000 per tier, 0 = no cap) stops a download with a warning.
+  Regression test: `test_markets_written_in_batches_and_capped`.
+- The partial KXINXU rows (845,501 markets, 20,677 outcomes, 3,425 events, no candles) were
+  deleted and the DB vacuumed (3.7 GB to 253 MB). Financial data must be re-ingested with a
+  smaller series before the five-category comparison is re-run.
+- Blocker found the same day: Windows Smart App Control (enforce mode) started blocking
+  `pandas/_libs/tslibs/base.cp313-win_amd64.pyd` (Code Integrity events 3033/3077). A
+  force-reinstall of the same pandas version did not help. Nothing that imports pandas runs
+  until this is resolved, so the full suite was not re-run.

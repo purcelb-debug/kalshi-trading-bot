@@ -75,14 +75,15 @@ def _category_row(cat: str, ds, res) -> dict:
 def compare_categories(engine: Engine, factories: dict, *, source=None, categories=None,
                        series=None, horizon: timedelta = timedelta(hours=6), n_folds: int = 5,
                        holdout_frac: float = 0.2, min_train: int = 50, n_boot: int = 300,
-                       min_rows: int = 100) -> tuple[pd.DataFrame, dict]:
+                       min_rows: int = 100, since=None) -> tuple[pd.DataFrame, dict]:
     """Walk-forward every category independently; return (ranked table, skipped reasons)."""
     from predlab.categories import CATEGORIES
 
     rows, skipped = [], {}
     for cat in categories or CATEGORIES:
         try:
-            ds = build_dataset(engine, source=source, category=cat, series=series, horizon=horizon)
+            ds = build_dataset(engine, source=source, category=cat, series=series,
+                               horizon=horizon, since=since)
         except ValueError as e:
             skipped[cat] = str(e)
             continue

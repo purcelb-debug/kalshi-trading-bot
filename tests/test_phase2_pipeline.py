@@ -274,3 +274,56 @@ def test_market_coverage_reported(sports_ds):
     ds.meta["market_mid"] = np.nan
     assert run_walk_forward(ds, {"market_implied": MarketImplied}, n_folds=2,
                             n_boot=20).market_coverage == 0.0
+
+
+def test_cpi_features_point_in_time_and_legacy_strikes(tmp_path):
+    """CPI YoY features: values become public one day after their FRED vintage date,
+    legacy tickers ("-T3.0") parse as 'above 3.0%', and the projection applies the
+    known base effect."""
+    from datetime import datetime
+
+    from predlab.db.schema import mkt_markets, mkt_series, outcomes
+    from predlab.timeutil import UTC
+    eng = make_engine(f"sqlite:///{tmp_path / 'cpi.db'}")
+    init_market_db(eng)
+    now = utcnow()
+    obs = []
+    for i in range(30):                       # 2024-01 .. 2026-06, +0.25%/month
+        month = pd.Timestamp("2024-01-01", tz="UTC") + pd.DateOffset(months=i)
+        release = month + pd.DateOffset(months=1, days=11)
+        obs.append({"source": "fred", "series_id": "CPIAUCNS", "obs_ts": month,
+                    "vintage_ts": release, "value": 300 * 1.0025 ** i, "units": None,
+                    "fetched_at": now})
+    upsert(eng, ext_observations, obs, ["source", "series_id", "obs_ts", "vintage_ts"])
+    upsert(eng, mkt_series, [{"series_ticker": "KXCPIYOY", "source": "kalshi", "title": "CPI",
+                              "source_category": "Economics", "category": "economics",
+                              "frequency": "monthly", "fee_type": "quadratic",
+                              "fee_multiplier": 1.0, "raw_json": None, "fetched_at": now}],
+           ["series_ticker"])
+    # Target month 2026-06, released 2026-07-12; decision 30h before a 2026-07-12 close.
+    close = datetime(2026, 7, 12, 12, 30, tzinfo=UTC)
+    mk = []
+    for t, st, fl in (("CPIYOY-26JUN-T3.0", None, None), ("KXCPIYOY-26JUN-T3.2", "greater", 3.2)):
+        mk.append({"ticker": t, "source": "kalshi", "event_ticker": t.rsplit("-", 1)[0],
+                   "series_ticker": "KXCPIYOY", "category": "economics", "title": t,
+                   "market_type": "binary", "status": "finalized", "open_time": None,
+                   "close_time": close, "expiration_time": close, "result": "yes",
+                   "expiration_value": None, "strike_type": st, "floor_strike": fl,
+                   "cap_strike": None, "yes_bid": None, "yes_ask": None, "no_bid": None,
+                   "no_ask": None, "last_price": None, "volume": None, "open_interest": None,
+                   "updated_time": close, "raw_json": None, "fetched_at": now})
+    upsert(eng, mkt_markets, mk, ["ticker"])
+    upsert(eng, outcomes, [{"ticker": m["ticker"], "recorded_at": close, "result": "yes",
+                            "resolved_ts": close, "source": "kalshi", "revised": False}
+                           for m in mk], ["ticker", "recorded_at"])
+    ds = build_dataset(eng, series="KXCPIYOY", horizon=timedelta(hours=30))
+    X = ds.X.set_index(ds.meta["ticker"])
+    yoy = round((1.0025 ** 12 - 1) * 100, 1)      # 3.0 for every month in this series
+    # last public month at decision (2026-07-11 06:30) is 2026-05 (released 2026-06-12)
+    assert X.loc["CPIYOY-26JUN-T3.0", "econ_margin_last"] == pytest.approx(yoy - 3.0)
+    assert X.loc["KXCPIYOY-26JUN-T3.2", "econ_margin_last"] == pytest.approx(yoy - 3.2)
+    # constant monthly change: projection = last YoY + mom - mom dropping out = last YoY
+    assert X.loc["KXCPIYOY-26JUN-T3.2", "econ_margin_proj"] == pytest.approx(yoy - 3.2, abs=1e-6)
+    assert (ds.meta["input_max_ts"] <= ds.meta["decision_ts"]).all()
+    # the target month itself (vintage 2026-07-12) must not be visible
+    assert ds.meta["input_max_ts"].max() < pd.Timestamp("2026-07-12", tz="UTC")

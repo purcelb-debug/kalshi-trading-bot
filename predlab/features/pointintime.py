@@ -229,14 +229,99 @@ def _weather(engine: Engine, base: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-FEATURE_SETS = {"market": _market_state, "per_market_obs": _per_market_obs, "weather": _weather}
+# Kalshi CPI year-over-year series -> FRED series it settles on (BLS headline 12-month
+# change = CPI-U, not seasonally adjusted, rounded to one decimal; checked 2026-10-29).
+ECON_SERIES = {"KXCPIYOY": "CPIAUCNS", "CPIYOY": "CPIAUCNS"}
+# FRED vintages have day resolution (midnight UTC) but BLS releases at 08:30 ET, so a value
+# is treated as public only one full day after its vintage date.
+FRED_PUBLIC_LAG = pd.Timedelta(days=1)
+_EVENT_MONTH = re.compile(r"-(\d{2})([A-Z]{3})$")
+_TICKER_STRIKE = re.compile(r"-T(-?\d+(?:\.\d+)?)$")
+
+
+def _econ_strike(r) -> tuple[str | None, float | None, float | None]:
+    if isinstance(r.strike_type, str) and r.strike_type:   # pandas gives NaN, not None
+        return (r.strike_type, None if pd.isna(r.floor_strike) else r.floor_strike,
+                None if pd.isna(r.cap_strike) else r.cap_strike)
+    m = _TICKER_STRIKE.search(r.ticker)   # legacy tickers: "-T8.0" = "above 8.0%"
+    return ("greater", float(m.group(1)), None) if m else (None, None, None)
+
+
+def _economics(engine: Engine, base: pd.DataFrame) -> pd.DataFrame:
+    """Point-in-time CPI features for CPI year-over-year markets.
+
+    econ_margin_last  latest *published* YoY (one decimal, as BLS reports it) vs the strike
+    econ_margin_proj  naive projection for the target month: last YoY plus the average of the
+                      last 3 monthly changes minus the change dropping out of the 12-month
+                      window (a base effect that is already known)
+    econ_yoy_mom      change between the last two published YoY values
+    """
+    ec = base[base["series_ticker"].isin(ECON_SERIES)]
+    if ec.empty:
+        return pd.DataFrame({"ticker": base["ticker"]})
+    with engine.connect() as c:
+        obs = pd.DataFrame(c.execute(
+            select(ext_observations.c.series_id, ext_observations.c.obs_ts,
+                   ext_observations.c.vintage_ts, ext_observations.c.value)
+            .where(ext_observations.c.source == "fred",
+                   ext_observations.c.series_id.in_(set(ECON_SERIES.values())))).mappings().all())
+    if obs.empty:
+        return pd.DataFrame({"ticker": base["ticker"]})
+    obs["obs_ts"], obs["vintage_ts"] = _to_ts(obs["obs_ts"]), _to_ts(obs["vintage_ts"])
+    obs["public_ts"] = obs["vintage_ts"] + FRED_PUBLIC_LAG
+    rows = []
+    for r in ec.itertuples():
+        row = {"ticker": r.ticker, "econ_margin_last": np.nan, "econ_margin_proj": np.nan,
+               "econ_yoy_mom": np.nan, "econ_ts": pd.NaT}
+        m = _EVENT_MONTH.search(r.event_ticker or "")
+        st, floor, cap = _econ_strike(r)
+        if not m or m.group(2) not in _MONTHS or st is None:
+            rows.append(row)
+            continue
+        target = pd.Timestamp(year=2000 + int(m.group(1)), month=_MONTHS[m.group(2)], day=1,
+                              tz="UTC")
+        s = obs[(obs["series_id"] == ECON_SERIES[r.series_ticker])
+                & (obs["public_ts"] <= r.decision_ts)].dropna(subset=["value"])
+        # latest vintage of each month known at decision time
+        s = s.sort_values("vintage_ts").groupby("obs_ts").tail(1).set_index("obs_ts")["value"]
+        s = s[s.index < target].sort_index()
+        if len(s) < 16:
+            rows.append(row)
+            continue
+        idx = s.reindex(pd.date_range(s.index.min(), s.index.max(), freq="MS", tz="UTC"))
+        yoy = (idx / idx.shift(12) - 1) * 100
+        mom = np.log(idx).diff() * 100
+        last = yoy.dropna()
+        if len(last) < 2:
+            rows.append(row)
+            continue
+        last_month = last.index[-1]
+        yoy_last = round(float(last.iloc[-1]), 1)
+        out_month = target - pd.DateOffset(months=12)
+        drop_out = mom.get(out_month, np.nan)
+        recent = mom.dropna().iloc[-3:].mean()
+        gap = (target.year - last_month.year) * 12 + target.month - last_month.month
+        # only defined one month ahead: YoY(t) ~ YoY(t-1) + mom(t) - mom(t-12)
+        proj = yoy_last + recent - drop_out if gap == 1 else np.nan
+        row["econ_margin_last"] = _margin(yoy_last, st, floor, cap)
+        row["econ_margin_proj"] = _margin(proj, st, floor, cap) if np.isfinite(proj) else np.nan
+        row["econ_yoy_mom"] = float(last.iloc[-1] - last.iloc[-2])
+        row["econ_ts"] = obs[(obs["public_ts"] <= r.decision_ts)]["public_ts"].max()
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+FEATURE_SETS = {"market": _market_state, "per_market_obs": _per_market_obs, "weather": _weather,
+                "economics": _economics}
 
 
 def build_dataset(engine: Engine, *, source=None, category=None, series=None,
                   horizon: timedelta = timedelta(hours=6),
-                  feature_sets=("market", "per_market_obs", "weather"),
-                  use_market_features: bool = True) -> Dataset:
+                  feature_sets=("market", "per_market_obs", "weather", "economics"),
+                  use_market_features: bool = True, since=None) -> Dataset:
     base = load_markets(engine, source=source, category=category, series=series)
+    if since is not None and not base.empty:
+        base = base[base["close_time"] >= pd.Timestamp(since)].reset_index(drop=True)
     if base.empty:
         raise ValueError("no settled binary markets match the filters")
     base["decision_ts"] = base["close_time"] - horizon
@@ -250,7 +335,7 @@ def build_dataset(engine: Engine, *, source=None, category=None, series=None,
     for name in feature_sets:
         part = FEATURE_SETS[name](engine, base)
         feats = feats.merge(part, on="ticker", how="left")
-        ts_cols += [c for c in part.columns if c in ("mkt_ts", "obs_ts", "wx_ts")]
+        ts_cols += [c for c in part.columns if c in ("mkt_ts", "obs_ts", "wx_ts", "econ_ts")]
     feats = base[["ticker"]].merge(feats, on="ticker", how="left")  # restore order
 
     input_max = feats[ts_cols].max(axis=1) if ts_cols else pd.Series(pd.NaT, index=feats.index)

@@ -18,6 +18,7 @@ class RunStats:
     rows: dict[str, int] = field(default_factory=dict)
     issues: int = 0
     error: str | None = None
+    warnings: list[str] = field(default_factory=list)
 
     def add(self, table: str, n: int) -> None:
         self.rows[table] = self.rows.get(table, 0) + n

@@ -6,6 +6,7 @@ import respx
 from sqlalchemy import func, select
 
 from predlab.config import Settings
+from predlab.data.collectors.base import RunStats
 from predlab.data.collectors.kalshi import KalshiCollector, make_client, norm_orderbook
 from predlab.data.http import HttpError
 from predlab.db.schema import (
@@ -239,3 +240,40 @@ def test_archive_candles_use_plain_dollar_strings():
         assert row["price_close"] == pytest.approx(0.01)
     bad = norm_candle(archive, "T", 60, utcnow()) | {"yes_ask_close": 0.0003}
     assert any(i["check_name"] == "sub_cent_price" for i in check_candle(bad))
+
+
+@respx.mock
+async def test_large_series_outcomes_chunked_and_since_limits_heavy_data(market_engine, settings):
+    """Regression (2026-10-30): a 20k-market series overflowed SQLite's variable limit.
+    ``since`` restricts trades/candles to recent markets but keeps all metadata."""
+    many = [{**market(f"KXHIGHNY-OLD-{i}", result="no"), "open_time": "2026-09-01T14:00:00Z",
+             "close_time": "2026-09-03T05:00:00Z"} for i in range(2500)]
+    recent = market("KXHIGHNY-NEW", result="yes")   # closes 2026-10-29
+    mock_bundle([{"markets": many + [recent], "cursor": ""}])
+    tr = respx.get(f"{BASE}/markets/trades").mock(return_value=httpx.Response(
+        200, json={"cursor": "", "trades": []}))
+    respx.get(f"{BASE}/historical/trades").mock(return_value=httpx.Response(
+        200, json={"cursor": "", "trades": []}))
+    async with make_client(settings) as client:
+        st = await KalshiCollector(market_engine, client).collect_series_bundle(
+            "KXHIGHNY", with_trades=True, include_archive=False,
+            since=to_utc("2026-10-28T00:00:00Z"))
+    assert st.rows["outcomes"] == 2501
+    assert [c.request.url.params["ticker"] for c in tr.calls] == ["KXHIGHNY-NEW"]
+
+
+@respx.mock
+async def test_markets_written_in_batches_and_capped(market_engine, settings):
+    """Regression (2026-10-30): an 845k-market archive was held in memory before writing.
+    Pages are now flushed in batches, and ``max_markets`` stops the download with a warning."""
+    rows = [market(f"KXHIGHNY-B-{i}", result="no") for i in range(30)]
+    mock_bundle([{"markets": rows[:10], "cursor": "c1"}, {"markets": rows[10:20], "cursor": "c2"},
+                 {"markets": rows[20:], "cursor": ""}])
+    async with make_client(settings) as client:
+        col = KalshiCollector(market_engine, client)
+        st = RunStats("kalshi")
+        kept = await col.collect_markets(st, series_ticker="KXHIGHNY", batch_size=7,
+                                         max_markets=25, keep=lambda m: m["ticker"].endswith("1"))
+    assert st.rows["mkt_markets"] == 25
+    assert [m["ticker"] for m in kept] == ["KXHIGHNY-B-1", "KXHIGHNY-B-11", "KXHIGHNY-B-21"]
+    assert st.warnings and "max_markets=25" in st.warnings[0]
