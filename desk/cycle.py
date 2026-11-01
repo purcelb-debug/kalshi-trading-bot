@@ -78,12 +78,20 @@ def register_desk(sim: Engine, cfg: DeskSettings, *, series: str, horizon_h: flo
     return dv
 
 
-def meetings_today(sim: Engine, deployment: str, now) -> int:
+def meetings_today(sim: Engine, now) -> int:
+    """Meetings held today by every desk deployment (the cap is shared)."""
     day = pd.Timestamp(now).normalize()
     with sim.connect() as c:
         return int(c.execute(select(func.count()).select_from(desk_meetings).where(
-            desk_meetings.c.deployment == deployment,
             desk_meetings.c.ts >= to_utc(day))).scalar() or 0)
+
+
+def desk_deployments(sim: Engine) -> list[str]:
+    """Registered desk deployments that are still live (not retired)."""
+    with sim.connect() as c:
+        return [r[0] for r in c.execute(select(model_registry.c.model_version).where(
+            model_registry.c.model_name == "desk", model_registry.c.status != "retired")
+            .order_by(model_registry.c.model_version))]
 
 
 def _shown(sim: Engine, deployment: str) -> set[str]:
@@ -164,7 +172,7 @@ def run_desk_cycle(market: Engine, sim: Engine, cfg: DeskSettings, loop: LoopCon
     if len(t):
         t = t[~t["ticker"].isin(_shown(sim, loop.deployment))]
     meeting, recorded, status = None, 0, "no_new_markets"
-    if len(t) and meetings_today(sim, loop.deployment, now) >= cfg.max_meetings_per_day:
+    if len(t) and meetings_today(sim, now) >= cfg.max_meetings_per_day:
         status = "meeting_cap_reached"
         log_event(sim, "desk", "warning", f"meeting cap reached {loop.deployment}",
                   {"cap": cfg.max_meetings_per_day, "waiting": t["ticker"].tolist()}, ts=now)
@@ -204,4 +212,4 @@ def run_desk_cycle(market: Engine, sim: Engine, cfg: DeskSettings, loop: LoopCon
     return out
 
 
-__all__ = ["Meeting", "desk_deployment", "register_desk", "run_desk_cycle"]
+__all__ = ["Meeting", "desk_deployment", "desk_deployments", "register_desk", "run_desk_cycle"]

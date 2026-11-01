@@ -115,7 +115,8 @@ def run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, *,
                                min_edge=cfg.min_edge, kelly_fraction=cfg.kelly_fraction,
                                max_order_usd=cfg.max_order_usd, shrink=shrink,
                                min_entry_price=cfg.min_entry_price,
-                               max_entry_price=cfg.max_entry_price)
+                               max_entry_price=cfg.max_entry_price,
+                               min_order_usd=cfg.min_order_usd)
         if plan is None:
             results.append({"ticker": r.ticker, "status": "skipped", "reason": why})
             continue

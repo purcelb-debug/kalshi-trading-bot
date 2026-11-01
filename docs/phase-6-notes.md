@@ -68,3 +68,19 @@ held position, a statistical go-live gate). Only the parts that filled gaps were
    `desk/.env`, then run `python -m desk.cli register --series KXHIGHNY` (meetings start on
    the next hourly run). `python -m desk.cli cycle --dry` previews the table for free.
 3. Scheduling: read and run `scripts/harden_task.ps1`.
+
+## 2026-11-01 later: wider coverage, minimum order
+- **Minimum order.** `EXECUTOR_MIN_ORDER_USD` (owner set $3): an order that already passes the
+  edge test is raised to the smallest size of at least that amount, still inside cash, the
+  per-order cap and the other caps. It never creates a trade without edge. The paper record
+  still sizes by plain Kelly, so live P&L will differ from the scorecard.
+- **Desk:** the daily meeting cap (default 8) is shared by every desk deployment, and
+  `desk.cli cycle --all` runs them all (one failing market doesn't stop the rest). News and
+  Skeptic default to `claude-sonnet-5-5`.
+- **Hourly job:** `scripts/run_loop.py` takes a list of quant deployments: all research cycles
+  first, then the desk, then one executor run per deployment. Each step has a 20 min timeout
+  and its run time is logged.
+- **New series checked (development walk-forward, holdout untouched, 30h):** KXINX and
+  KXAPRPOTUS have no candle history (0% market-price coverage), so they can't be compared
+  with the market and were not added. On KXCPIYOY every model was worse than the market
+  itself. None of the three trade.

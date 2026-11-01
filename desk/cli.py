@@ -41,6 +41,7 @@ def register(series: str = typer.Option(...), horizon: float = 30.0):
 
 @app.command()
 def cycle(deployment: str = typer.Option("desk@KXHIGHNY-h30"),
+          all_: bool = typer.Option(False, "--all", help="every registered desk deployment"),
           dry: bool = typer.Option(False, "--dry", help="show the table; no LLM calls")):
     """Hold a meeting if markets newly reached their decision point, then refresh the
     desk's paper record. The predlab loop step collects data first."""
@@ -48,11 +49,22 @@ def cycle(deployment: str = typer.Option("desk@KXHIGHNY-h30"),
 
     import pandas as pd
 
-    from desk.cycle import market_table, opening_text, run_desk_cycle
+    from desk.cycle import desk_deployments, market_table, opening_text, run_desk_cycle
     from predlab.loop.runner import DeploymentError, LoopConfig, load_deployment
     from predlab.timeutil import utcnow
 
     cfg, (market, sim) = DeskSettings(), _engines()
+    if all_:
+        # One failing market must not stop the others; the exit code still reports it.
+        failed = []
+        for dep in desk_deployments(sim):
+            try:
+                out = run_desk_cycle(market, sim, cfg, LoopConfig(dep, report_dir=cfg.report_dir))
+                typer.echo(json.dumps({"deployment": dep, "desk": out["desk"]}, default=str))
+            except Exception as e:  # noqa: BLE001 - reported, then the next market runs
+                failed.append(dep)
+                typer.echo(f"{dep} failed: {type(e).__name__}: {e}", err=True)
+        raise typer.Exit(1 if failed else 0)
     loop = LoopConfig(deployment, report_dir=cfg.report_dir)
     if dry:   # works before registration: series and horizon come from the id
         series, h = deployment.split("@", 1)[1].rsplit("-h", 1)

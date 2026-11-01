@@ -255,3 +255,23 @@ def test_ledger_sync_and_realized_pnl(tmp_path):
     assert len(s) == 1 and s.iloc[0]["realized_pnl"] == pytest.approx(10.0 - 7.0 - 0.15)
     assert f.iloc[0]["source"] == "bot" and s.iloc[0]["source"] == "bot"
     assert len(b) == 2 and b.iloc[-1]["equity"] == pytest.approx(27.36)
+
+
+def test_minimum_order_raises_small_kelly_sizes_within_caps():
+    from predlab.backtest.decision import plan_order
+    from predlab.backtest.execution import Quote
+    from predlab.backtest.fees import FeeSchedule
+    from predlab.timeutil import utcnow
+
+    q = Quote(utcnow(), "book", [(0.40, 500.0)], [(0.61, 500.0)], 0.39, 0.60)
+    kw = {"fees": FeeSchedule(), "equity": 5.0, "min_edge": 0.03, "kelly_fraction": 0.25,
+          "shrink": 1.0}
+    small, why = plan_order("T", 0.55, q, cash=25.0, max_order_usd=10, **kw)
+    bumped, _ = plan_order("T", 0.55, q, cash=25.0, max_order_usd=10, min_order_usd=3, **kw)
+    assert small is None and why == "size below one contract"      # Kelly alone: no order
+    unit = bumped.cost_usd / bumped.count
+    assert 3 <= bumped.cost_usd < 3 + unit                           # smallest size >= $3
+    # never forced past cash or the per-order cap, and never turns a no-edge market into a trade
+    assert plan_order("T", 0.55, q, cash=2.0, max_order_usd=10, min_order_usd=3, **kw)[0] is None
+    assert plan_order("T", 0.55, q, cash=25.0, max_order_usd=2, min_order_usd=3, **kw)[0] is None
+    assert plan_order("T", 0.40, q, cash=25.0, max_order_usd=10, min_order_usd=3, **kw)[0] is None

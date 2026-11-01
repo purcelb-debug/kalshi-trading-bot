@@ -22,8 +22,9 @@ from tests.test_phase5 import AS_OF, SERIES, START
 
 
 def _claude(**kw):
-    return DeskSettings(_env_file=None, provider="claude", model="claude-opus-5-5",
-                        search_provider="claude", **kw)
+    return DeskSettings(**{"_env_file": None, "provider": "claude", "model": "claude-opus-5-5",
+                           "search_provider": "claude", "search_model": "claude-opus-5-5",
+                           "skeptic_model": "claude-opus-5-5", **kw})
 
 
 def _gemini(**kw):
@@ -239,3 +240,18 @@ def test_default_desk_sends_only_search_roles_to_claude():
     assert not any(k.get("tools") for k in gem.calls) and len(gem.calls) == 4
     assert {k["model"] for k in gem.calls} == {"gemini-3.8-flash"}
     assert claude.calls[1]["output_config"]["effort"] == "high"          # the Skeptic
+
+
+def test_meeting_cap_is_shared_across_desk_deployments(sim_engine):
+    from desk.cycle import desk_deployments, init_desk_db, meetings_today
+    a = register_desk(sim_engine, _claude(), series="AAA", horizon_h=30)
+    b = register_desk(sim_engine, _claude(), series="BBB", horizon_h=30)
+    assert desk_deployments(sim_engine) == [a, b]
+    init_desk_db(sim_engine)
+    now = pd.Timestamp("2026-11-01 15:00", tz="UTC")
+    with sim_engine.begin() as c:
+        for dep in (a, b, b):
+            c.execute(desk_meetings.insert().values(deployment=dep, ts=now.to_pydatetime(),
+                                                    tickers_json=[], transcript=""))
+    assert meetings_today(sim_engine, now) == 3
+    assert meetings_today(sim_engine, now + pd.Timedelta(days=1)) == 0

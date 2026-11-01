@@ -38,6 +38,8 @@ class ExecutorSettings(BaseSettings):
     max_order_usd: float | None = Field(default=None, gt=0)
     daily_loss_stop_usd: float | None = Field(default=None, gt=0)
     max_market_usd: float | None = Field(default=None, gt=0)
+    #: Orders that pass the edge test are raised to at least this size (None = Kelly only).
+    min_order_usd: float | None = Field(default=None, gt=0)
 
     max_orders_per_day: int = Field(default=20, gt=0)
     max_consecutive_errors: int = Field(default=3, gt=0)

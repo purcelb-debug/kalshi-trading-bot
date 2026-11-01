@@ -23,14 +23,15 @@ class DeskSettings(BaseSettings):
     provider: Literal["claude", "gemini"] = "gemini"
     model: str = "gemini-3.8-flash"
     search_provider: Literal["claude", "gemini"] = "claude"
-    search_model: str = "claude-opus-5-5"    # News Checker
-    skeptic_model: str = "claude-opus-5-5"   # Skeptic, also on search_provider
+    search_model: str = "claude-sonnet-5-5"    # News Checker
+    skeptic_model: str = "claude-sonnet-5-5"   # Skeptic, also on search_provider
     effort: str = "medium"           # Claude effort / Gemini thinking_level
     skeptic_effort: str = "high"
     gemini_api_key: str = Field(default="", validation_alias=AliasChoices(
         "GEMINI_API_KEY", "gemini_api_key"))
     search_max_uses: int = Field(default=5, ge=1)        # Claude only
-    max_meetings_per_day: int = Field(default=4, ge=1)   # hard cost cap
+    #: Hard cost cap: meetings per UTC day across ALL desk deployments combined.
+    max_meetings_per_day: int = Field(default=8, ge=1)
     max_picks: int = Field(default=3, ge=1)               # markets the Scanner may pick
     max_buys: int = Field(default=3, ge=0)                # BUYs kept per meeting
     p_floor: float = Field(default=0.02, gt=0, lt=0.5)    # desk p_yes clipped to [floor, 1-floor]
