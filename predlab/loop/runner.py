@@ -223,7 +223,6 @@ def run_cycle(market: Engine, sim: Engine, cfg: LoopConfig, *, now=None,
     dep = load_deployment(sim, cfg.deployment)
     params = dep["params_json"]
     series, horizon = params["series"], timedelta(hours=params["horizon_h"])
-    gate = (dep["validation_json"] or {}).get("gate", {})
     strategy = StrategyConfig(**{**(dep["validation_json"] or {}).get("strategy", {}),
                                  "initial_cash": cfg.paper_cash})
     if collect is not None:
@@ -254,6 +253,16 @@ def run_cycle(market: Engine, sim: Engine, cfg: LoopConfig, *, now=None,
                if pd.notna(m)}
         new = record_forecasts(sim, items, market_ref=ref, created_ts=now)
 
+    return update_paper_record(market, sim, cfg, dep, now=now, strategy=strategy,
+                               new_forecasts=new, prior_forecasts=len(done))
+
+
+def update_paper_record(market: Engine, sim: Engine, cfg: LoopConfig, dep: dict, *, now,
+                        strategy: StrategyConfig, new_forecasts: int,
+                        prior_forecasts: int) -> dict:
+    """Replay the forward log, check degradation, write gate evidence and the report.
+    Shared by every deployment kind (fitted models and the LLM desk)."""
+    new, gate = new_forecasts, (dep["validation_json"] or {}).get("gate", {})
     bt, scored = replay_paper(market, sim, cfg.deployment, now=now, strategy=strategy)
     alerts, diag = check_degradation(scored, bt, cfg, strategy)
     _log_alerts_once_per_day(sim, cfg.deployment, alerts, now)
@@ -262,8 +271,10 @@ def run_cycle(market: Engine, sim: Engine, cfg: LoopConfig, *, now=None,
     days, n_alerts, start = _paper_stats(sim, cfg.deployment)
     summary = bt.summary if bt is not None else {}
     gate = {**gate, "paper_days": days, "paper_degradation_alerts": n_alerts,
-            "paper_start": start, "paper_forecasts": int(len(done) + new),
-            "paper_resolved": diag["resolved"], "paper_net_pnl": summary.get("net_pnl"),
+            "paper_start": start, "paper_forecasts": int(prior_forecasts + new),
+            "paper_resolved": diag["resolved"],
+            "paper_settled_trades": summary.get("n_settled", 0),
+            "paper_net_pnl": summary.get("net_pnl"),
             "paper_net_pnl_ci95": summary.get("net_pnl_ci95"),
             "paper_brier_diff_vs_market": (diag.get("brier_diff_vs_market") or {}).get("estimate"),
             "paper_updated": str(now)}
