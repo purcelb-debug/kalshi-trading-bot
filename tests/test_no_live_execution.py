@@ -54,3 +54,11 @@ def test_env_template_has_no_exchange_credentials():
     env = (ROOT / ".env.example").read_text(encoding="utf-8")
     keys = re.findall(r"^([A-Z_]+)=", env, re.MULTILINE)
     assert not [k for k in keys if re.search(r"KALSHI.*(KEY|SECRET)|TRADING|LIVE", k)], keys
+
+
+def test_predlab_never_imports_outbound_packages():
+    """executor (orders), notify (Telegram POSTs) and desk (LLM calls) sit outside predlab;
+    predlab must not reach into them."""
+    pat = re.compile(r"^\s*(import|from)\s+(executor|notify|desk)\b", re.MULTILINE)
+    offenders = [p.name for p in SOURCES if pat.search(p.read_text("utf-8"))]
+    assert offenders == []
