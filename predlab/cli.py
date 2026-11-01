@@ -523,5 +523,32 @@ def paper_status():
             typer.echo(f"  rejected because: {reason}")
 
 
+@app.command("scorecard")
+def scorecard_cmd(deployment: str = typer.Option("", help="one deployment id"),
+                  days: int = typer.Option(7, help="window in days; 0 = whole record"),
+                  all_: bool = typer.Option(False, "--all", help="every non-retired deployment"),
+                  report_dir: str = "reports"):
+    """Grade the forward paper record: win rate, expectancy, losing streak, P&L, Brier."""
+    from sqlalchemy import select as sel
+
+    from predlab.db.schema import model_registry
+    from predlab.loop.scorecard import format_scorecard, scorecard, write_scorecard
+
+    if not deployment and not all_:
+        raise typer.BadParameter("pass --deployment or --all")
+    s = get_settings()
+    market, sim = _market_engine(), make_engine(s.sim_db_url)
+    init_sim_db(sim)
+    deps = [deployment] if deployment else []
+    if all_:
+        with sim.connect() as c:
+            deps = [r.model_version for r in c.execute(
+                sel(model_registry.c.model_version).where(model_registry.c.status != "retired"))]
+    for d in deps:
+        card = scorecard(market, sim, d, days=days or None)
+        typer.echo(format_scorecard(card))
+        typer.echo(f"  -> {write_scorecard(card, report_dir)}")
+
+
 if __name__ == "__main__":
     app()
