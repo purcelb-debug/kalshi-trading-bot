@@ -14,7 +14,7 @@ import pandas as pd
 from sqlalchemy import JSON, Column, Engine, Integer, MetaData, String, Table, Text, func, select
 
 from desk.config import DeskSettings
-from desk.meeting import Meeting, run_meeting
+from desk.meeting import Meeting, providers, run_meeting
 from desk.validate import parse_trades
 from predlab.backtest.engine import StrategyConfig
 from predlab.db.schema import UTCDateTime, forecasts, mkt_markets, model_registry
@@ -39,8 +39,8 @@ desk_meetings = Table(
 )
 
 
-def desk_deployment(series: str, horizon_h: float, provider: str = "claude") -> str:
-    return f"desk-{provider}@{series}-h{horizon_h:g}"
+def desk_deployment(series: str, horizon_h: float) -> str:
+    return f"desk@{series}-h{horizon_h:g}"
 
 
 def init_desk_db(sim: Engine) -> None:
@@ -51,7 +51,7 @@ def register_desk(sim: Engine, cfg: DeskSettings, *, series: str, horizon_h: flo
                   category: str | None = None) -> str:
     """Admit the desk to forward paper trading. It has no holdout evidence and never can
     (an LLM cannot be replayed point-in-time on history), so its go-live gate stays closed."""
-    dv = desk_deployment(series, horizon_h, cfg.provider)
+    dv = desk_deployment(series, horizon_h)
     with sim.connect() as c:
         if c.execute(select(model_registry.c.model_version)
                      .where(model_registry.c.model_version == dv)).first():
@@ -65,8 +65,11 @@ def register_desk(sim: Engine, cfg: DeskSettings, *, series: str, horizon_h: flo
         c.execute(model_registry.insert().values(
             model_version=dv, model_name="desk", category=category, params_hash="desk",
             params_json={"model": "desk", "model_version": dv, "series": series,
-                         "horizon_h": horizon_h, "params": {"provider": cfg.provider, "model": cfg.model,
-                                                            "skeptic_model": cfg.skeptic_model}},
+                         "horizon_h": horizon_h, "params": {
+                             "provider": cfg.provider, "model": cfg.model,
+                             "search_provider": cfg.search_provider,
+                             "search_model": cfg.search_model,
+                             "skeptic_model": cfg.skeptic_model}},
             trained_ts=now, validation_json={
                 "strategy": asdict(strat), "gate": gate,
                 "reasons": ["LLM desk: no holdout certification is possible"]},
@@ -144,7 +147,7 @@ def _save_transcript(cfg: DeskSettings, deployment: str, now, text: str) -> None
 
 
 def run_desk_cycle(market: Engine, sim: Engine, cfg: DeskSettings, loop: LoopConfig, *,
-                   client=None, now=None) -> dict:
+                   clients: dict | None = None, now=None) -> dict:
     """One cycle. The meeting runs only when markets newly reach their decision point and
     the daily meeting cap allows; the paper record is refreshed every cycle regardless."""
     init_desk_db(sim)
@@ -166,10 +169,10 @@ def run_desk_cycle(market: Engine, sim: Engine, cfg: DeskSettings, loop: LoopCon
         log_event(sim, "desk", "warning", f"meeting cap reached {loop.deployment}",
                   {"cap": cfg.max_meetings_per_day, "waiting": t["ticker"].tolist()}, ts=now)
     elif len(t):
-        if client is None:
+        if clients is None:
             from desk.llm import make_client
-            client = make_client(cfg)
-        meeting = run_meeting(client, cfg, opening_text(t, now))
+            clients = {p: make_client(cfg, p) for p in providers(cfg)}
+        meeting = run_meeting(clients, cfg, opening_text(t, now))
         decisions, notes = parse_trades(meeting.lead_text,
                                         dict(zip(t["ticker"], t["event_ticker"])),
                                         max_buys=cfg.max_buys, p_floor=cfg.p_floor)

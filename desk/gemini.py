@@ -22,12 +22,10 @@ def _usage(resp, role: str, model: str) -> dict:
                                                      or []))}
 
 
-def ask(client, cfg: DeskSettings, role: str, system: str, chat: str, *, search: bool,
-        skeptic: bool) -> tuple[str, list[dict]]:
-    model = cfg.skeptic_model if skeptic else cfg.model
+def ask(client, cfg: DeskSettings, role: str, system: str, chat: str, *, model: str,
+        effort: str, search: bool) -> tuple[str, list[dict]]:
     kw = {"model": model, "input": chat, "system_instruction": system, "store": False,
-          "generation_config": {"thinking_level": cfg.skeptic_effort if skeptic else cfg.effort,
-                                "max_output_tokens": 16000}}
+          "generation_config": {"thinking_level": effort, "max_output_tokens": 16000}}
     note = ""
     if search:
         try:

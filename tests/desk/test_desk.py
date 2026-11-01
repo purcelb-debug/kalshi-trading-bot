@@ -20,6 +20,18 @@ from predlab.db.schema import forecasts
 from predlab.loop.runner import LoopConfig
 from tests.test_phase5 import AS_OF, SERIES, START
 
+
+def _claude(**kw):
+    return DeskSettings(_env_file=None, provider="claude", model="claude-opus-5-5",
+                        search_provider="claude", **kw)
+
+
+def _gemini(**kw):
+    return DeskSettings(**{"_env_file": None, "provider": "gemini", "search_provider": "gemini",
+                           "search_model": "gemini-3.8-flash",
+                           "skeptic_model": "gemini-3.8-flash", **kw})
+
+
 ALLOWED = {"A-1": "EV-A", "A-2": "EV-A", "B-1": "EV-B", "C-1": "EV-C", "D-1": "EV-D"}
 
 
@@ -80,25 +92,25 @@ def _resp(text, stop="end_turn"):
 def test_ask_resumes_pause_turn_and_handles_refusal():
     seq = iter([_resp("part one ", "pause_turn"), _resp("part two")])
     c = FakeClient(lambda kw: next(seq))
-    text, usage = ask(c, DeskSettings(_env_file=None, provider="claude"), "NEWS", "sys", "chat", search=True,
-                      skeptic=False)
+    text, usage = ask(c, _claude(), "NEWS", "sys", "chat", model="m", effort="medium",
+                      search=True)
     assert text == "part one part two" and len(usage) == 2
     assert c.calls[1]["messages"][1]["role"] == "assistant"     # resumed, no extra user turn
     assert c.calls[0]["fallbacks"] == "default" and c.calls[0]["tools"][0]["name"] == "web_search"
     c2 = FakeClient(lambda kw: NS(**{**vars(_resp("")), "stop_reason": "refusal"}))
-    assert "declined" in ask(c2, DeskSettings(_env_file=None, provider="claude"), "RISK", "s", "c", search=False,
-                             skeptic=False)[0]
+    assert "declined" in ask(c2, _claude(), "RISK", "s", "c", model="m",
+                             effort="medium", search=False)[0]
 
 
 def test_meeting_stops_when_scanner_sees_nothing():
     c = FakeClient(lambda kw: "NOTHING UNUSUAL")
-    m = run_meeting(c, DeskSettings(_env_file=None, provider="claude"), "table")
+    m = run_meeting({"claude": c}, _claude(), "table")
     assert len(c.calls) == 1 and m.transcript == [("SCANNER", "NOTHING UNUSUAL")]
 
 
 def test_skeptic_uses_its_own_model():
     c = FakeClient(lambda kw: "ok")
-    run_meeting(c, DeskSettings(_env_file=None, provider="claude", skeptic_model="claude-sonnet-5-5"), "table")
+    run_meeting({"claude": c}, _claude(skeptic_model="claude-sonnet-5-5"), "table")
     models = [k["model"] for k in c.calls]
     assert models[4] == "claude-sonnet-5-5" and models.count("claude-sonnet-5-5") == 1
 
@@ -120,14 +132,14 @@ def synth(market_engine):
 
 
 def test_desk_cycle_records_buys_once_and_builds_paper_record(synth, sim_engine, tmp_path):
-    cfg = DeskSettings(_env_file=None, provider="claude", report_dir=str(tmp_path / "reports"), max_buys=3)
+    cfg = _claude(report_dir=str(tmp_path / "reports"), max_buys=3)
     dep = register_desk(sim_engine, cfg, series=SERIES, horizon_h=6.0)
     loop = LoopConfig(dep, report_dir=cfg.report_dir)
     client = FakeClient(_buy_everything)
     outs = []
     t = AS_OF
     while t <= AS_OF + pd.Timedelta(days=3):
-        outs.append(run_desk_cycle(synth, sim_engine, cfg, loop, client=client, now=t))
+        outs.append(run_desk_cycle(synth, sim_engine, cfg, loop, clients={"claude": client}, now=t))
         t += timedelta(hours=1)
     held = [o for o in outs if o["desk"]["status"] == "meeting_held"]
     assert held, "no meeting was held"
@@ -148,7 +160,7 @@ def test_desk_cycle_records_buys_once_and_builds_paper_record(synth, sim_engine,
 
 def test_meeting_cap_blocks_extra_meetings(synth, sim_engine, tmp_path):
     from desk.cycle import init_desk_db
-    cfg = DeskSettings(_env_file=None, provider="claude", report_dir=str(tmp_path / "r"),
+    cfg = _claude(report_dir=str(tmp_path / "r"),
                        max_meetings_per_day=1)
     dep = register_desk(sim_engine, cfg, series=SERIES, horizon_h=6.0)
     loop = LoopConfig(dep, report_dir=cfg.report_dir)
@@ -158,7 +170,7 @@ def test_meeting_cap_blocks_extra_meetings(synth, sim_engine, tmp_path):
     with sim_engine.begin() as c:                      # today's one meeting already happened
         c.execute(desk_meetings.insert().values(deployment=dep, ts=day.to_pydatetime(),
                                                 tickers_json=[], transcript=""))
-    statuses = [run_desk_cycle(synth, sim_engine, cfg, loop, client=client,
+    statuses = [run_desk_cycle(synth, sim_engine, cfg, loop, clients={"claude": client},
                                now=day + timedelta(hours=h))["desk"]["status"]
                 for h in range(1, 24)]
     assert "meeting_cap_reached" in statuses and "meeting_held" not in statuses
@@ -166,7 +178,7 @@ def test_meeting_cap_blocks_extra_meetings(synth, sim_engine, tmp_path):
 
 
 def test_register_refuses_duplicates(sim_engine):
-    cfg = DeskSettings(_env_file=None, provider="claude")
+    cfg = _claude()
     register_desk(sim_engine, cfg, series="X", horizon_h=30)
     with pytest.raises(ValueError):
         register_desk(sim_engine, cfg, series="X", horizon_h=30)
@@ -191,7 +203,7 @@ class FakeGemini:
 
 def test_gemini_meeting_uses_search_on_news_and_skeptic_only():
     c = FakeGemini(lambda kw: "ok")
-    m = run_meeting(c, DeskSettings(_env_file=None, provider="gemini", skeptic_model="gemini-x"),
+    m = run_meeting({"gemini": c}, _gemini(skeptic_model="gemini-x"),
                     "table")
     with_search = [i for i, k in enumerate(c.calls) if k.get("tools")]
     assert with_search == [1, 4] and c.calls[4]["model"] == "gemini-x"
@@ -203,15 +215,27 @@ def test_gemini_meeting_uses_search_on_news_and_skeptic_only():
 def test_gemini_falls_back_without_search_and_handles_no_answer():
     from desk.gemini import ask as gask
     c = FakeGemini(lambda kw: "news", fail_search=True)
-    text, usage = gask(c, DeskSettings(_env_file=None, provider="gemini"), "NEWS", "s", "c", search=True,
-                       skeptic=False)
+    text, usage = gask(c, _gemini(), "NEWS", "s", "c", model="g", effort="medium",
+                       search=True)
     assert text.startswith("(web search unavailable") and text.endswith("news")
     assert len(c.calls) == 2 and "tools" not in c.calls[1] and len(usage) == 1
     blocked = FakeGemini(lambda kw: None, status="failed")
-    assert "no opinion" in gask(blocked, DeskSettings(_env_file=None, provider="gemini"), "RISK", "s", "c",
-                                search=False, skeptic=False)[0]
+    assert "no opinion" in gask(blocked, _gemini(), "RISK", "s", "c",
+                                model="g", effort="medium", search=False)[0]
 
 
 def test_gemini_desk_registers_under_its_own_name(sim_engine):
-    dep = register_desk(sim_engine, DeskSettings(_env_file=None, provider="gemini"), series="X", horizon_h=30)
-    assert dep == "desk-gemini@X-h30"
+    dep = register_desk(sim_engine, _gemini(), series="X", horizon_h=30)
+    assert dep == "desk@X-h30"
+
+
+def test_default_desk_sends_only_search_roles_to_claude():
+    claude, gem = FakeClient(lambda kw: "c"), FakeGemini(lambda kw: "g")
+    m = run_meeting({"claude": claude, "gemini": gem}, DeskSettings(_env_file=None), "table")
+    assert [r for r, _ in m.transcript] == ["SCANNER", "NEWS", "PRICER", "RISK", "SKEPTIC",
+                                            "DESK LEAD"]
+    assert [msg for _, msg in m.transcript] == ["g", "c", "g", "g", "c", "g"]
+    assert all(k.get("tools") for k in claude.calls) and len(claude.calls) == 2
+    assert not any(k.get("tools") for k in gem.calls) and len(gem.calls) == 4
+    assert {k["model"] for k in gem.calls} == {"gemini-3.8-flash"}
+    assert claude.calls[1]["output_config"]["effort"] == "high"          # the Skeptic

@@ -1,7 +1,8 @@
 """One desk meeting: six LLM calls in order, each reading the whole chat so far.
 
-``ask`` below is the Claude backend; ``desk.gemini.ask`` is the Gemini one, picked by
-``DeskSettings.provider``. News Checker and Skeptic get web search. Every Claude call opts into
+``ask`` below is the Claude backend and ``desk.gemini.ask`` the Gemini one. News Checker and
+Skeptic need web search and run on ``search_provider``; the other four roles run on
+``provider``. Every Claude call opts into
 server-side refusal fallbacks (``fallbacks="default"``), so a safety decline is retried
 on Anthropic's recommended model in the same request. Nothing here sizes or places
 anything; the transcript is just text for ``desk.validate`` to parse.
@@ -53,12 +54,12 @@ def _usage(resp, role: str) -> dict:
                                     "web_search_requests", 0) or 0}
 
 
-def ask(client, cfg: DeskSettings, role: str, system: str, chat: str, *, search: bool,
-        skeptic: bool) -> tuple[str, list[dict]]:
+def ask(client, cfg: DeskSettings, role: str, system: str, chat: str, *, model: str,
+        effort: str, search: bool) -> tuple[str, list[dict]]:
     """Claude: one role's message and the usage of every request it took."""
-    kw = {"model": cfg.skeptic_model if skeptic else cfg.model, "max_tokens": 16000,
+    kw = {"model": model, "max_tokens": 16000,
           "system": system, "betas": [FALLBACK_BETA], "fallbacks": "default",
-          "output_config": {"effort": cfg.skeptic_effort if skeptic else cfg.effort}}
+          "output_config": {"effort": effort}}
     if search:
         kw["tools"] = [{"type": "web_search_20260209", "name": "web_search",
                         "max_uses": cfg.search_max_uses}]
@@ -78,16 +79,25 @@ def ask(client, cfg: DeskSettings, role: str, system: str, chat: str, *, search:
     return "".join(text).strip() or "(no answer)", usage
 
 
-def run_meeting(client, cfg: DeskSettings, opening: str, prompts: dict | None = None) -> Meeting:
-    """Run the six roles over ``opening`` (the code-built market table)."""
+def providers(cfg: DeskSettings) -> set[str]:
+    return {cfg.provider, cfg.search_provider}
+
+
+def run_meeting(clients: dict, cfg: DeskSettings, opening: str,
+                prompts: dict | None = None) -> Meeting:
+    """Run the six roles over ``opening`` (the code-built market table). ``clients`` maps
+    each provider in ``providers(cfg)`` to its SDK client."""
+    from desk import gemini
+
+    backends = {"claude": ask, "gemini": gemini.ask}
     prompts = prompts or load_prompts(cfg)
-    if cfg.provider == "gemini":
-        from desk.gemini import ask as role_ask
-    else:
-        role_ask = ask
     m, chat = Meeting(), opening
     for name, key, search, skeptic in ROLES:
-        msg, usage = role_ask(client, cfg, name, prompts[key], chat, search=search, skeptic=skeptic)
+        prov = cfg.search_provider if search else cfg.provider
+        model = cfg.skeptic_model if skeptic else cfg.search_model if search else cfg.model
+        msg, usage = backends[prov](clients[prov], cfg, name, prompts[key], chat, model=model,
+                                    effort=cfg.skeptic_effort if skeptic else cfg.effort,
+                                    search=search)
         m.transcript.append((name, msg))
         m.usage += usage
         chat += f"\n\n[{name}]\n{msg}"

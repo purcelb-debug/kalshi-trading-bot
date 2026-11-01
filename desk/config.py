@@ -17,10 +17,14 @@ class DeskSettings(BaseSettings):
                                       env_file_encoding="utf-8", extra="ignore",
                                       env_ignore_empty=True, populate_by_name=True)
 
-    #: Which LLM runs the six roles. Set the model names to match when switching.
-    provider: Literal["claude", "gemini"] = "claude"
-    model: str = "claude-opus-5-5"
-    skeptic_model: str = "claude-opus-5-5"   # the Skeptic can get its own model
+    #: Scanner, Pricer, Risk and Desk Lead run on ``provider`` (no web search needed, so a
+    #: free Gemini key is enough). News and Skeptic need web search and run on
+    #: ``search_provider``. Set the model names to match each provider.
+    provider: Literal["claude", "gemini"] = "gemini"
+    model: str = "gemini-3.8-flash"
+    search_provider: Literal["claude", "gemini"] = "claude"
+    search_model: str = "claude-opus-5-5"    # News Checker
+    skeptic_model: str = "claude-opus-5-5"   # Skeptic, also on search_provider
     effort: str = "medium"           # Claude effort / Gemini thinking_level
     skeptic_effort: str = "high"
     gemini_api_key: str = Field(default="", validation_alias=AliasChoices(

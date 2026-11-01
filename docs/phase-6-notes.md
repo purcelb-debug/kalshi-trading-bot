@@ -23,15 +23,17 @@ held position, a statistical go-live gate). Only the parts that filled gaps were
   history. `weekly` sends the scorecard plus the gate verdict. It's off until `notify/.env`
   has a token and chat id (see `notify/.env.example`). Delivery failure keeps the state
   unadvanced, so messages resend next run.
-- **Six-role LLM desk** (`desk/`, outside predlab). Claude by default (`claude-opus-5-5`).
-  Gemini is an option (`DESK_PROVIDER=gemini`, `gemini-3.8-flash`, Interactions API with
-  `store=False`). The roles are Scanner, News Checker
+- **Six-role LLM desk** (`desk/`, outside predlab), deployment `desk@<series>-h<h>`. Roles
+  that don't search (Scanner, Pricer, Risk, Desk Lead) run on `DESK_PROVIDER` (default Gemini
+  `gemini-3.8-flash` on a free key, Interactions API with `store=False`). News Checker and
+  Skeptic need web search and run on `DESK_SEARCH_PROVIDER` (default Claude `claude-opus-5-5`
+  with its web search tool), so the Anthropic key is only spent on searching roles. The roles are Scanner, News Checker
   (web search), Pricer, Risk Manager, Skeptic (web search, separate model setting) and
   Desk Lead, with prompts in `desk/prompts.json` (reloaded every meeting). The desk proposes
   `p_yes` and an action. Code then:
   - keeps only tickers that were on the table, at most 1 BUY per event and `DESK_MAX_BUYS`
     per meeting, and clips p to [0.02, 0.98], so malformed output means no trades;
-  - records only BUYs as forecasts under `desk-<provider>@<series>-h<h>`;
+  - records only BUYs as forecasts under `desk@<series>-h<h>`;
   - replays them through the same engine, shrink (fixed 0.5), Kelly sizing, caps, alerts
     and gate evidence as fitted models (`update_paper_record`, extracted from `run_cycle`).
   - Each market is shown to the desk once, at its decision point. The daily meeting cap
@@ -62,7 +64,7 @@ held position, a statistical go-live gate). Only the parts that filled gaps were
 ## Owner actions to turn things on
 1. Telegram: create a bot with @BotFather, get the chat id, fill in `notify/.env`, then run
    `python -m notify.cli digest --test`.
-2. Desk: put `ANTHROPIC_API_KEY` in `.env`, optionally copy `desk/.env.example` to
+2. Desk: put `GEMINI_API_KEY` and `ANTHROPIC_API_KEY` in `.env`, optionally copy `desk/.env.example` to
    `desk/.env`, then run `python -m desk.cli register --series KXHIGHNY` (meetings start on
    the next hourly run). `python -m desk.cli cycle --dry` previews the table for free.
 3. Scheduling: read and run `scripts/harden_task.ps1`.

@@ -7,8 +7,8 @@ Otherwise each SDK's own credential lookup."""
 from desk.config import DeskSettings
 
 
-def make_client(cfg: DeskSettings):
-    if cfg.provider == "gemini":
+def make_client(cfg: DeskSettings, provider: str):
+    if provider == "gemini":
         from google import genai
 
         return genai.Client(api_key=cfg.gemini_api_key) if cfg.gemini_api_key else genai.Client()
