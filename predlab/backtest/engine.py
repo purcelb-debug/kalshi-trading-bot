@@ -240,6 +240,7 @@ def _result(pf, signals, resolutions, orders, fills, rejects, strategy, executio
         "n_fills": len(fills_df),
         "n_positions": len(pos),
         "open_positions_at_end": int((~pos["settled"]).sum()) if len(pos) else 0,
+        "n_settled": len(settled),
         "contracts": float(fills_df["qty"].sum()) if len(fills_df) else 0.0,
         "uncertain_fill_share": float(fills_df["liquidity_uncertain"].mean()) if len(fills_df) else 0.0,
         "partial_or_unfilled_orders": int((orders_df["status"] != "filled").sum()) if len(orders_df) else 0,

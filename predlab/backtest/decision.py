@@ -28,18 +28,20 @@ def plan_order(ticker: str, p_yes: float, quote: Quote, fees: FeeSchedule, *, eq
                min_entry_price: float = 0.05, max_entry_price: float = 0.95
                ) -> tuple[Plan | None, str]:
     p_yes = shrink_to_market(p_yes, quote_mid(quote), shrink)
-    best = None
+    best, outside_band = None, False
     for outcome, q, asks in (("yes", p_yes, quote.yes_asks), ("no", 1 - p_yes, quote.no_asks)):
         if not asks:
             continue
         a = asks[0][0]
         if not min_entry_price <= a <= max_entry_price:
+            outside_band = True
             continue
         ev = _ev(q, a, fees)
         if best is None or ev > best[2]:
             best = (outcome, q, ev, a)
     if best is None:
-        return None, "no_asks"
+        return None, (f"price outside {min_entry_price:.2f}-{max_entry_price:.2f} entry band"
+                      if outside_band else "no_asks")
     outcome, q, ev, a = best
     if ev < min_edge:
         return None, f"edge {ev:.3f} < min_edge {min_edge}"
