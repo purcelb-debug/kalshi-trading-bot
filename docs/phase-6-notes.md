@@ -23,17 +23,21 @@ held position, a statistical go-live gate). Only the parts that filled gaps were
   history. `weekly` sends the scorecard plus the gate verdict. It's off until `notify/.env`
   has a token and chat id (see `notify/.env.example`). Delivery failure keeps the state
   unadvanced, so messages resend next run.
-- **Six-role Claude desk** (`desk/`, outside predlab). The roles are Scanner, News Checker
+- **Six-role LLM desk** (`desk/`, outside predlab). Claude by default (`claude-opus-5-5`).
+  Gemini is an option (`DESK_PROVIDER=gemini`, `gemini-3.8-flash`, Interactions API with
+  `store=False`). The roles are Scanner, News Checker
   (web search), Pricer, Risk Manager, Skeptic (web search, separate model setting) and
   Desk Lead, with prompts in `desk/prompts.json` (reloaded every meeting). The desk proposes
   `p_yes` and an action. Code then:
   - keeps only tickers that were on the table, at most 1 BUY per event and `DESK_MAX_BUYS`
     per meeting, and clips p to [0.02, 0.98], so malformed output means no trades;
-  - records only BUYs as forecasts under `desk-claude@<series>-h<h>`;
+  - records only BUYs as forecasts under `desk-<provider>@<series>-h<h>`;
   - replays them through the same engine, shrink (fixed 0.5), Kelly sizing, caps, alerts
     and gate evidence as fitted models (`update_paper_record`, extracted from `run_cycle`).
   - Each market is shown to the desk once, at its decision point. The daily meeting cap
-    defaults to 4. Every call uses `fallbacks="default"` for refusals and logs token use in
+    defaults to 4. Claude calls use `fallbacks="default"` for refusals. Google Search grounding
+  needs a paid-tier Gemini key: on a free key, News and Skeptic answer without search and the
+  transcript says so. Every call logs token use in
     the `desk_meetings` table (sim.db), and transcripts go to `reports/desk-meetings/`.
 - `scripts/run_loop.py` now runs: predlab loop, desk cycle, executor, sync, notify digest.
   The desk step does nothing until the desk is registered.

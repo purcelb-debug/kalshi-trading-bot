@@ -80,25 +80,25 @@ def _resp(text, stop="end_turn"):
 def test_ask_resumes_pause_turn_and_handles_refusal():
     seq = iter([_resp("part one ", "pause_turn"), _resp("part two")])
     c = FakeClient(lambda kw: next(seq))
-    text, usage = ask(c, DeskSettings(_env_file=None), "NEWS", "sys", "chat", search=True,
+    text, usage = ask(c, DeskSettings(_env_file=None, provider="claude"), "NEWS", "sys", "chat", search=True,
                       skeptic=False)
     assert text == "part one part two" and len(usage) == 2
     assert c.calls[1]["messages"][1]["role"] == "assistant"     # resumed, no extra user turn
     assert c.calls[0]["fallbacks"] == "default" and c.calls[0]["tools"][0]["name"] == "web_search"
     c2 = FakeClient(lambda kw: NS(**{**vars(_resp("")), "stop_reason": "refusal"}))
-    assert "declined" in ask(c2, DeskSettings(_env_file=None), "RISK", "s", "c", search=False,
+    assert "declined" in ask(c2, DeskSettings(_env_file=None, provider="claude"), "RISK", "s", "c", search=False,
                              skeptic=False)[0]
 
 
 def test_meeting_stops_when_scanner_sees_nothing():
     c = FakeClient(lambda kw: "NOTHING UNUSUAL")
-    m = run_meeting(c, DeskSettings(_env_file=None), "table")
+    m = run_meeting(c, DeskSettings(_env_file=None, provider="claude"), "table")
     assert len(c.calls) == 1 and m.transcript == [("SCANNER", "NOTHING UNUSUAL")]
 
 
 def test_skeptic_uses_its_own_model():
     c = FakeClient(lambda kw: "ok")
-    run_meeting(c, DeskSettings(_env_file=None, skeptic_model="claude-sonnet-5-5"), "table")
+    run_meeting(c, DeskSettings(_env_file=None, provider="claude", skeptic_model="claude-sonnet-5-5"), "table")
     models = [k["model"] for k in c.calls]
     assert models[4] == "claude-sonnet-5-5" and models.count("claude-sonnet-5-5") == 1
 
@@ -120,7 +120,7 @@ def synth(market_engine):
 
 
 def test_desk_cycle_records_buys_once_and_builds_paper_record(synth, sim_engine, tmp_path):
-    cfg = DeskSettings(_env_file=None, report_dir=str(tmp_path / "reports"), max_buys=3)
+    cfg = DeskSettings(_env_file=None, provider="claude", report_dir=str(tmp_path / "reports"), max_buys=3)
     dep = register_desk(sim_engine, cfg, series=SERIES, horizon_h=6.0)
     loop = LoopConfig(dep, report_dir=cfg.report_dir)
     client = FakeClient(_buy_everything)
@@ -148,7 +148,8 @@ def test_desk_cycle_records_buys_once_and_builds_paper_record(synth, sim_engine,
 
 def test_meeting_cap_blocks_extra_meetings(synth, sim_engine, tmp_path):
     from desk.cycle import init_desk_db
-    cfg = DeskSettings(_env_file=None, report_dir=str(tmp_path / "r"), max_meetings_per_day=1)
+    cfg = DeskSettings(_env_file=None, provider="claude", report_dir=str(tmp_path / "r"),
+                       max_meetings_per_day=1)
     dep = register_desk(sim_engine, cfg, series=SERIES, horizon_h=6.0)
     loop = LoopConfig(dep, report_dir=cfg.report_dir)
     client = FakeClient(_buy_everything)
@@ -165,7 +166,52 @@ def test_meeting_cap_blocks_extra_meetings(synth, sim_engine, tmp_path):
 
 
 def test_register_refuses_duplicates(sim_engine):
-    cfg = DeskSettings(_env_file=None)
+    cfg = DeskSettings(_env_file=None, provider="claude")
     register_desk(sim_engine, cfg, series="X", horizon_h=30)
     with pytest.raises(ValueError):
         register_desk(sim_engine, cfg, series="X", horizon_h=30)
+
+
+class FakeGemini:
+    """Interactions API stand-in; ``fail_search`` mimics a free-tier key."""
+
+    def __init__(self, answer, fail_search=False, status="completed"):
+        self.answer, self.fail_search, self.status, self.calls = answer, fail_search, status, []
+        self.interactions = NS(create=self._create)
+
+    def _create(self, **kw):
+        self.calls.append(kw)
+        if self.fail_search and kw.get("tools"):
+            raise RuntimeError("search grounding not available")
+        return NS(status=self.status, model=kw["model"], output_text=self.answer(kw),
+                  usage=NS(total_input_tokens=10, total_output_tokens=5, total_thought_tokens=3,
+                           total_cached_tokens=None,
+                           grounding_tool_count=[NS(count=2)] if kw.get("tools") else None))
+
+
+def test_gemini_meeting_uses_search_on_news_and_skeptic_only():
+    c = FakeGemini(lambda kw: "ok")
+    m = run_meeting(c, DeskSettings(_env_file=None, provider="gemini", skeptic_model="gemini-x"),
+                    "table")
+    with_search = [i for i, k in enumerate(c.calls) if k.get("tools")]
+    assert with_search == [1, 4] and c.calls[4]["model"] == "gemini-x"
+    assert all(k["store"] is False and k["system_instruction"] for k in c.calls)
+    assert c.calls[4]["generation_config"]["thinking_level"] == "high"
+    assert m.usage[1]["web_searches"] == 2 and m.usage[0]["output_tokens"] == 8
+
+
+def test_gemini_falls_back_without_search_and_handles_no_answer():
+    from desk.gemini import ask as gask
+    c = FakeGemini(lambda kw: "news", fail_search=True)
+    text, usage = gask(c, DeskSettings(_env_file=None, provider="gemini"), "NEWS", "s", "c", search=True,
+                       skeptic=False)
+    assert text.startswith("(web search unavailable") and text.endswith("news")
+    assert len(c.calls) == 2 and "tools" not in c.calls[1] and len(usage) == 1
+    blocked = FakeGemini(lambda kw: None, status="failed")
+    assert "no opinion" in gask(blocked, DeskSettings(_env_file=None, provider="gemini"), "RISK", "s", "c",
+                                search=False, skeptic=False)[0]
+
+
+def test_gemini_desk_registers_under_its_own_name(sim_engine):
+    dep = register_desk(sim_engine, DeskSettings(_env_file=None, provider="gemini"), series="X", horizon_h=30)
+    assert dep == "desk-gemini@X-h30"

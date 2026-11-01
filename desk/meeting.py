@@ -1,6 +1,7 @@
-"""One desk meeting: six Claude calls in order, each reading the whole chat so far.
+"""One desk meeting: six LLM calls in order, each reading the whole chat so far.
 
-News Checker and Skeptic get the server-side web search tool. Every call opts into
+``ask`` below is the Claude backend; ``desk.gemini.ask`` is the Gemini one, picked by
+``DeskSettings.provider``. News Checker and Skeptic get web search. Every Claude call opts into
 server-side refusal fallbacks (``fallbacks="default"``), so a safety decline is retried
 on Anthropic's recommended model in the same request. Nothing here sizes or places
 anything; the transcript is just text for ``desk.validate`` to parse.
@@ -54,7 +55,7 @@ def _usage(resp, role: str) -> dict:
 
 def ask(client, cfg: DeskSettings, role: str, system: str, chat: str, *, search: bool,
         skeptic: bool) -> tuple[str, list[dict]]:
-    """One role's message and the usage of every request it took."""
+    """Claude: one role's message and the usage of every request it took."""
     kw = {"model": cfg.skeptic_model if skeptic else cfg.model, "max_tokens": 16000,
           "system": system, "betas": [FALLBACK_BETA], "fallbacks": "default",
           "output_config": {"effort": cfg.skeptic_effort if skeptic else cfg.effort}}
@@ -80,9 +81,13 @@ def ask(client, cfg: DeskSettings, role: str, system: str, chat: str, *, search:
 def run_meeting(client, cfg: DeskSettings, opening: str, prompts: dict | None = None) -> Meeting:
     """Run the six roles over ``opening`` (the code-built market table)."""
     prompts = prompts or load_prompts(cfg)
+    if cfg.provider == "gemini":
+        from desk.gemini import ask as role_ask
+    else:
+        role_ask = ask
     m, chat = Meeting(), opening
     for name, key, search, skeptic in ROLES:
-        msg, usage = ask(client, cfg, name, prompts[key], chat, search=search, skeptic=skeptic)
+        msg, usage = role_ask(client, cfg, name, prompts[key], chat, search=search, skeptic=skeptic)
         m.transcript.append((name, msg))
         m.usage += usage
         chat += f"\n\n[{name}]\n{msg}"

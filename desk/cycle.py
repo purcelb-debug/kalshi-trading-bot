@@ -39,8 +39,8 @@ desk_meetings = Table(
 )
 
 
-def desk_deployment(series: str, horizon_h: float) -> str:
-    return f"desk-claude@{series}-h{horizon_h:g}"
+def desk_deployment(series: str, horizon_h: float, provider: str = "claude") -> str:
+    return f"desk-{provider}@{series}-h{horizon_h:g}"
 
 
 def init_desk_db(sim: Engine) -> None:
@@ -51,7 +51,7 @@ def register_desk(sim: Engine, cfg: DeskSettings, *, series: str, horizon_h: flo
                   category: str | None = None) -> str:
     """Admit the desk to forward paper trading. It has no holdout evidence and never can
     (an LLM cannot be replayed point-in-time on history), so its go-live gate stays closed."""
-    dv = desk_deployment(series, horizon_h)
+    dv = desk_deployment(series, horizon_h, cfg.provider)
     with sim.connect() as c:
         if c.execute(select(model_registry.c.model_version)
                      .where(model_registry.c.model_version == dv)).first():
@@ -65,7 +65,7 @@ def register_desk(sim: Engine, cfg: DeskSettings, *, series: str, horizon_h: flo
         c.execute(model_registry.insert().values(
             model_version=dv, model_name="desk", category=category, params_hash="desk",
             params_json={"model": "desk", "model_version": dv, "series": series,
-                         "horizon_h": horizon_h, "params": {"model": cfg.model,
+                         "horizon_h": horizon_h, "params": {"provider": cfg.provider, "model": cfg.model,
                                                             "skeptic_model": cfg.skeptic_model}},
             trained_ts=now, validation_json={
                 "strategy": asdict(strat), "gate": gate,
@@ -168,7 +168,7 @@ def run_desk_cycle(market: Engine, sim: Engine, cfg: DeskSettings, loop: LoopCon
     elif len(t):
         if client is None:
             from desk.llm import make_client
-            client = make_client()
+            client = make_client(cfg)
         meeting = run_meeting(client, cfg, opening_text(t, now))
         decisions, notes = parse_trades(meeting.lead_text,
                                         dict(zip(t["ticker"], t["event_ticker"])),

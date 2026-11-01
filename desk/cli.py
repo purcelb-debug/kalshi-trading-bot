@@ -6,7 +6,7 @@ import typer
 
 from desk.config import DeskSettings
 
-app = typer.Typer(add_completion=False, help="Six-role Claude desk. PAPER TRADING ONLY.")
+app = typer.Typer(add_completion=False, help="Six-role LLM desk. PAPER TRADING ONLY.")
 
 
 def _engines():
@@ -40,7 +40,7 @@ def register(series: str = typer.Option(...), horizon: float = 30.0):
 
 
 @app.command()
-def cycle(deployment: str = typer.Option("desk-claude@KXHIGHNY-h30"),
+def cycle(deployment: str = typer.Option("", help="default: desk-<provider>@KXHIGHNY-h30"),
           dry: bool = typer.Option(False, "--dry", help="show the table; no LLM calls")):
     """Hold a meeting if markets newly reached their decision point, then refresh the
     desk's paper record. The predlab loop step collects data first."""
@@ -48,11 +48,12 @@ def cycle(deployment: str = typer.Option("desk-claude@KXHIGHNY-h30"),
 
     import pandas as pd
 
-    from desk.cycle import market_table, opening_text, run_desk_cycle
+    from desk.cycle import desk_deployment, market_table, opening_text, run_desk_cycle
     from predlab.loop.runner import DeploymentError, LoopConfig, load_deployment
     from predlab.timeutil import utcnow
 
     cfg, (market, sim) = DeskSettings(), _engines()
+    deployment = deployment or desk_deployment("KXHIGHNY", 30.0, cfg.provider)
     loop = LoopConfig(deployment, report_dir=cfg.report_dir)
     if dry:   # works before registration: series and horizon come from the id
         series, h = deployment.split("@", 1)[1].rsplit("-h", 1)
