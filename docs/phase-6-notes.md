@@ -84,3 +84,7 @@ held position, a statistical go-live gate). Only the parts that filled gaps were
   KXAPRPOTUS have no candle history (0% market-price coverage), so they can't be compared
   with the market and were not added. On KXCPIYOY every model was worse than the market
   itself. None of the three trade.
+- **Desk runs twice a day per city:** desk deployments are registered at two horizons for
+  each of KXHIGHNY, KXHIGHCHI and KXHIGHMIA: 30h before close (about 7-8 PM ET the day before)
+  and 12h before close (about 1-2 PM ET on the day). Each horizon is its own paper record,
+  and a market is shown once per horizon. That's 6 meetings a day, inside the shared cap of 8.
