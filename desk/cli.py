@@ -69,6 +69,13 @@ def cycle(deployment: str = typer.Option("desk@KXHIGHNY-h30"),
     if dry:   # works before registration: series and horizon come from the id
         series, h = deployment.split("@", 1)[1].rsplit("-h", 1)
         now = utcnow()
+        if series == "ALL":
+            from desk.cycle import _shown, init_desk_db
+            from desk.scan import scan_table, scan_text
+            init_desk_db(sim)
+            t = scan_table(cfg, exclude=_shown(sim, deployment), now=now)
+            typer.echo(scan_text(t, now) if len(t) else "no markets pass the scan filters now")
+            return
         t = market_table(market, sim, cfg, series=series, horizon=pd.Timedelta(hours=float(h)),
                          late=loop.late_tolerance, now=now)
         typer.echo(opening_text(t, now) if len(t) else "no markets at their decision point now")

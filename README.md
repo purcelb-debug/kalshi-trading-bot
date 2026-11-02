@@ -3,8 +3,9 @@
 A research system for [Kalshi](https://kalshi.com) prediction markets. It collects
 public market data, builds point-in-time features, compares forecasting models against the
 market price, paper-trades every candidate, and sends one candidate to a small, capped
-real-money executor. A six-role LLM "desk" paper-trades alongside the models, so the
-two approaches can be compared on the same scorecard.
+real-money executor. A six-role LLM "desk" works alongside the models: one desk scans
+every liquid Kalshi market closing in the next 48 hours and trades a small, capped real
+account, and the others paper-trade weather markets so they can be scored like the models.
 
 > **Not financial advice.** This is a personal research project. The live executor trades
 > a deliberately tiny bankroll, and so far no model here has shown an edge over the market
@@ -19,7 +20,7 @@ two approaches can be compared on the same scorecard.
   predlab/   data collectors -> point-in-time features -> models -> walk-forward evaluation
              -> holdout certification -> hourly paper-trading loop -> go-live gate evidence
                                   |                           |
-                  desk/ (LLM, paper only)            executor/ (real money, capped)
+                  desk/ (LLM: broad scan + paper)    executor/ (real money, capped)
                                   |                           |
                                   +-----> notify/ (Telegram) <+
 ```
@@ -27,8 +28,8 @@ two approaches can be compared on the same scorecard.
 | Package | What it does |
 | --- | --- |
 | `predlab/` | Research core. Data ingestion (Kalshi markets, candles, trades, order books; NCEI observed temperatures; NWS forecasts; FRED macro series), point-in-time feature building with look-ahead checks, 13 models (from market-implied baselines to logistic/LightGBM/stacked ensembles), walk-forward evaluation with an untouched holdout, an event-driven backtest engine with Kalshi's fee schedule, stress tests and overfitting probes, and the hourly paper-trading loop. **predlab never places orders**: `tests/test_no_live_execution.py` fails the build if it makes a write request or imports the trading packages. |
-| `executor/` | Places real orders on Kalshi for one deployment. Hard caps in code: bankroll, per-order and per-market limits, daily loss stop, orders per day, consecutive-error halt, kill-switch file, never adds to a held position, and a go-live gate. It keeps a hash-chained audit log and reconciles positions from the exchange before every cycle. |
-| `desk/` | Six LLM roles (Scanner, News Checker, Pricer, Risk Manager, Skeptic, Desk Lead) debate each market at its decision point. The roles that need web search run on Claude, the rest on Gemini. **Their output is untrusted text.** Code keeps only tickers that were on the table, one BUY per event, a few per meeting, and clips probabilities. Sizing and caps are never the model's call. The desk paper-trades only. |
+| `executor/` | Places real orders on Kalshi for a deployment. Hard caps in code: bankroll, minimum and maximum order size, per-market limit, daily loss stop, orders per day, consecutive-error halt, kill-switch file, never adds to a held position, and a go-live gate. For desk positions it also sells early when the desk's take-profit or stop is reached, with close-only (`reduce_only`) orders, and never re-buys a market it exited. It keeps a hash-chained audit log and reconciles positions from the exchange before every cycle. |
+| `desk/` | Six LLM roles (Scanner, News Checker, Pricer, Risk Manager, Skeptic, Desk Lead) debate each market at its decision point. The roles that need web search run on Claude, the rest on Gemini (falling back to Claude if Gemini is down). `desk@ALL` scans the ~10,000 open markets closing within 48h, filters them in code (price, spread, volume, time to close) and shows the desk the top 40 by volume. **The desk's output is untrusted text.** Code keeps only tickers that were on the table, one BUY per event, a few per meeting, clips probabilities and exit levels, and enforces a daily LLM spending cap. Sizing and money limits are never the model's call. |
 | `notify/` | Sends Telegram messages only when something changes: alerts, gate flips, fills, halts, desk transcripts, a stale loop. Also sends a weekly scorecard. |
 | `scripts/` | The hourly Windows Task Scheduler job (research loop, desk, executor, ledger sync, digest) and the task setup script. |
 
@@ -44,7 +45,9 @@ two approaches can be compared on the same scorecard.
 - **Shrink toward the market.** Forecasts are blended with the market mid using a factor
   fitted on development data, and trades need a minimum edge after fees.
 - **LLMs propose, code decides.** A prompt-injected or confused desk transcript can, at
-  most, change a probability for a market that was already on the table.
+  most, change a probability or exit level for a market that was already on the table.
+  The desk's real-money trading runs under the owner's gate override, which the audit log
+  records every cycle, because an LLM can't be backtested without look-ahead.
 
 ## Results
 

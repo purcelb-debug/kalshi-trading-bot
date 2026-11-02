@@ -143,8 +143,30 @@ class KalshiTradingClient:
             "time_in_force": "immediate_or_cancel", "self_trade_prevention_type": "taker_at_cross",
             "post_only": False, "reduce_only": False, "cancel_order_on_pause": True,
         }
-        d = self._call("POST", "/portfolio/events/orders", json=body)
+        return self._ack(self._call("POST", "/portfolio/events/orders", json=body), cid)
 
+    def place_ioc_exit(self, ticker: str, held: str, count: int, min_price: float,
+                       client_order_id: str | None = None) -> OrderAck:
+        """Immediate-or-cancel close of a held ``held`` ("yes"/"no") position: sells at
+        >= ``min_price`` for that side, or not at all. ``reduce_only`` makes the exchange
+        refuse anything that would open or grow a position."""
+        if count < 1 or not 0.01 <= min_price <= 0.99:
+            raise ValueError("count must be >= 1 and price within [0.01, 0.99]")
+        if held not in ("yes", "no"):
+            raise ValueError(held)
+        cid = client_order_id or str(uuid.uuid4())
+        # Selling YES = the YES ask side at >= p. Selling NO = buying YES at <= 1 - p.
+        body = {
+            "ticker": ticker, "client_order_id": cid,
+            "side": "ask" if held == "yes" else "bid", "count": str(int(count)),
+            "price": f"{(min_price if held == 'yes' else round(1 - min_price, 4)):.4f}",
+            "time_in_force": "immediate_or_cancel", "self_trade_prevention_type": "taker_at_cross",
+            "post_only": False, "reduce_only": True, "cancel_order_on_pause": True,
+        }
+        return self._ack(self._call("POST", "/portfolio/events/orders", json=body), cid)
+
+    @staticmethod
+    def _ack(d: dict, cid: str) -> OrderAck:
         def f(k):
             return float(d[k]) if d.get(k) not in (None, "") else None
 

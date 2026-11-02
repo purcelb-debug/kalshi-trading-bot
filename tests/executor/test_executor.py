@@ -275,3 +275,97 @@ def test_minimum_order_raises_small_kelly_sizes_within_caps():
     assert plan_order("T", 0.55, q, cash=2.0, max_order_usd=10, min_order_usd=3, **kw)[0] is None
     assert plan_order("T", 0.55, q, cash=25.0, max_order_usd=2, min_order_usd=3, **kw)[0] is None
     assert plan_order("T", 0.40, q, cash=25.0, max_order_usd=10, min_order_usd=3, **kw)[0] is None
+
+
+def test_exit_order_body_is_reduce_only_on_the_opposite_book_side():
+    import json as _json
+    sent = []
+
+    def handler(req):
+        sent.append(_json.loads(req.read()))
+        return httpx.Response(201, json={"order_id": "o", "fill_count": "4.00",
+                                         "remaining_count": "0.00"})
+
+    c = KalshiTradingClient("https://k/trade-api/v2", "kid", ed25519.Ed25519PrivateKey.generate(),
+                            transport=httpx.MockTransport(handler))
+    c.place_ioc_exit("T", "yes", 4, 0.62)      # sell YES at >= 0.62
+    c.place_ioc_exit("T", "no", 4, 0.30)       # sell NO at >= 0.30 = buy YES at <= 0.70
+    assert [(b["side"], b["price"], b["reduce_only"]) for b in sent] == [
+        ("ask", "0.6200", True), ("bid", "0.7000", True)]
+    assert all(b["time_in_force"] == "immediate_or_cancel" for b in sent)
+    with pytest.raises(ValueError):
+        c.place_ioc_exit("T", "maybe", 1, 0.5)
+
+
+def test_plan_exit_rules():
+    from executor.exits import plan_exit
+    from predlab.backtest.execution import Quote
+    from predlab.timeutil import utcnow
+
+    def q(yes_bid, no_bid):
+        return Quote(utcnow(), "book", [], [], yes_bid, no_bid)
+
+    lv = {"side": "yes", "take_profit": 0.60, "stop": 0.35}
+    pos = {"ticker": "T", "side": "yes", "qty": 7.0}
+    assert plan_exit(pos, lv, q(0.50, 0.48)) is None                      # between levels
+    tp = plan_exit(pos, lv, q(0.63, 0.35))
+    assert (tp.reason, tp.count, tp.min_price) == ("take_profit", 7, 0.63)
+    assert plan_exit(pos, lv, q(0.34, 0.64)).reason == "stop"
+    assert plan_exit(pos, lv, q(None, 0.5)) is None                       # no bid: can't sell
+    assert plan_exit({**pos, "side": "no"}, lv, q(0.30, 0.70)) is None    # other side held
+    assert plan_exit(pos, None, q(0.9, 0.1)) is None                      # no levels: settle
+    no = plan_exit({**pos, "side": "no"}, {**lv, "side": "no"}, q(0.30, 0.66))
+    assert (no.reason, no.min_price) == ("take_profit", 0.66)
+
+
+def test_cycle_exits_before_buying_and_never_rebuys(tmp_path):
+    import pandas as pd
+
+    from executor.client import OrderAck
+    from executor.config import GATE_OVERRIDE_PHRASE
+    from executor.runner import run_cycle
+    from predlab.backtest.execution import Quote
+    from predlab.db.repo import init_sim_db, make_engine
+    from predlab.forecasts import record_forecasts
+    from predlab.models.base import Forecast
+    from predlab.timeutil import utcnow
+    sim = make_engine(f"sqlite:///{tmp_path / 'sim.db'}")
+    init_sim_db(sim)
+    now = pd.Timestamp(utcnow())
+    exp = {"side": "yes", "take_profit": 0.60, "stop": 0.35}
+    record_forecasts(sim, [Forecast("HELD", "desk@ALL-h48", 0.70, None, None, now, now, (), exp)])
+    exits, buys = [], []
+
+    class Client:
+        held = True
+
+        def balance_usd(self):
+            return 25.0, 4.0
+
+        def positions(self):
+            return ([{"ticker": "HELD", "side": "yes", "qty": 6, "exposure_usd": 2.4,
+                      "fees_usd": 0.1}] if self.held else [])
+
+        def place_ioc_exit(self, ticker, held, count, min_price):
+            exits.append((ticker, held, count, min_price))
+            self.held = False
+            return OrderAck("x1", "c1", float(count), 0.0, min_price, 0.01)
+
+        def place_ioc_buy(self, *a):
+            buys.append(a)
+            return OrderAck("o1", "c1", 1.0, 0.0, 0.4, 0.01)
+
+    book = Quote(now, "book", [(0.40, 500.0)], [(0.61, 500.0)], 0.65, 0.35)
+    cfg = ExecutorSettings(_env_file=None, mode="live", live_key_id="k", live_key_path="p",
+                           data_dir=str(tmp_path), kill_switch_path=str(tmp_path / "KILL"),
+                           bankroll_cap_usd=25, max_order_usd=10, daily_loss_stop_usd=25,
+                           gate_override=GATE_OVERRIDE_PHRASE, attended=False)
+    c = Client()
+    out = run_cycle(cfg, sim, "desk@ALL-h48", client=c, quotes={"HELD": book})
+    assert exits == [("HELD", "yes", 6, 0.65)] and out[0]["status"] == "exited"
+    assert buys == [] and out[1]["reason"] == "exited earlier"       # not re-bought this cycle
+    out2 = run_cycle(cfg, sim, "desk@ALL-h48", client=c, quotes={"HELD": book})
+    assert buys == [] and out2[0]["reason"] == "exited earlier"      # nor next cycle
+    events = [json_line["event"] for json_line in map(__import__("json").loads,
+              (tmp_path / "audit_live.jsonl").read_text().splitlines())]
+    assert "exit_submit" in events and "exit_ack" in events

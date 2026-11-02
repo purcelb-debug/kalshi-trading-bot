@@ -6,7 +6,23 @@ refused search request is asked again without the tool and the answer says so.
 Requests are sent with ``store=False``: nothing is kept server-side between roles.
 """
 
+import time
+
 from desk.config import DeskSettings
+
+RETRY_DELAYS_S = (2.0, 6.0, 15.0)     # Gemini 503 "high demand" spikes are short
+
+
+def _create(client, sleep=time.sleep, **kw):
+    for delay in (*RETRY_DELAYS_S, None):
+        try:
+            return client.interactions.create(**kw)
+        except Exception as e:
+            code = getattr(e, "status_code", None) or getattr(e, "code", None)
+            transient = code in (429, 500, 502, 503, 504) or "Connection" in type(e).__name__
+            if delay is None or not transient:
+                raise
+            sleep(delay)
 
 
 def _usage(resp, role: str, model: str) -> dict:
@@ -29,12 +45,12 @@ def ask(client, cfg: DeskSettings, role: str, system: str, chat: str, *, model: 
     note = ""
     if search:
         try:
-            resp = client.interactions.create(tools=[{"type": "google_search"}], **kw)
+            resp = _create(client, tools=[{"type": "google_search"}], **kw)
         except Exception as e:  # noqa: BLE001 - e.g. search grounding not on this tier
             note = f"(web search unavailable: {type(e).__name__}; answered without it)\n"
-            resp = client.interactions.create(**kw)
+            resp = _create(client, **kw)
     else:
-        resp = client.interactions.create(**kw)
+        resp = _create(client, **kw)
     usage = [_usage(resp, role, model)]
     text = (resp.output_text or "").strip() if resp.status == "completed" else ""
     if not text:

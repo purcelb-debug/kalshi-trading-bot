@@ -255,3 +255,82 @@ def test_meeting_cap_is_shared_across_desk_deployments(sim_engine):
                                                     tickers_json=[], transcript=""))
     assert meetings_today(sim_engine, now) == 3
     assert meetings_today(sim_engine, now + pd.Timedelta(days=1)) == 0
+
+
+def _scan_rows():
+    close = (pd.Timestamp("2026-11-02 12:00", tz="UTC") + pd.Timedelta(hours=10)).isoformat()
+    rows = []
+    for i in range(5):                               # one busy event with 5 markets
+        rows.append({"ticker": f"BIG-{i}", "event_ticker": "BIG", "title": "big", "yes_bid": 0.40,
+                     "yes_ask": 0.42, "volume": 9000, "volume_24h": 5000 - i,
+                     "open_interest": 100, "close_time": close})
+    rows += [
+        {"ticker": "WIDE", "event_ticker": "W", "title": "w", "yes_bid": 0.30, "yes_ask": 0.45,
+         "volume": 9000, "volume_24h": 9000, "open_interest": 1, "close_time": close},
+        {"ticker": "CHEAP", "event_ticker": "C", "title": "c", "yes_bid": 0.01, "yes_ask": 0.03,
+         "volume": 9000, "volume_24h": 9000, "open_interest": 1, "close_time": close},
+        {"ticker": "THIN", "event_ticker": "T", "title": "t", "yes_bid": 0.50, "yes_ask": 0.52,
+         "volume": 5, "volume_24h": 5, "open_interest": 1, "close_time": close},
+        {"ticker": "OK", "event_ticker": "O", "title": "ok", "yes_bid": 0.60, "yes_ask": 0.63,
+         "volume": 500, "volume_24h": 300, "open_interest": 1, "close_time": close},
+        {"ticker": "SEEN", "event_ticker": "S", "title": "s", "yes_bid": 0.50, "yes_ask": 0.51,
+         "volume": 9000, "volume_24h": 9999, "open_interest": 1, "close_time": close}]
+    return rows
+
+
+def test_scan_filters_and_ranks_in_code():
+    from desk.scan import filter_rank
+    t = filter_rank(pd.DataFrame(_scan_rows()), DeskSettings(_env_file=None), exclude={"SEEN"},
+                    now=pd.Timestamp("2026-11-02 12:00", tz="UTC"))
+    assert t["ticker"].tolist() == ["BIG-0", "BIG-1", "OK"]   # 2 per event, filters, ranked
+    assert t["hours_to_close"].round(1).eq(10.0).all()
+
+
+def test_broad_desk_meets_within_budget_and_records_exits(sim_engine, tmp_path):
+    from desk.cycle import meeting_cost, spend_today
+    cfg = _claude(report_dir=str(tmp_path / "r"), daily_budget_usd=1.0)
+    dep = register_desk(sim_engine, cfg, series="ALL", horizon_h=48)
+    loop = LoopConfig(dep, report_dir=cfg.report_dir)
+    now = pd.Timestamp("2026-11-02 12:00", tz="UTC")
+
+    def lead(kw):
+        if "DESK LEAD" not in kw["system"]:
+            return "notes"
+        return _lead([{"ticker": "OK", "action": "BUY", "side": "yes", "p_yes": 0.75,
+                       "take_profit": 0.72, "stop": 0.50, "reason": "x"},
+                      {"ticker": "ZZZ", "action": "BUY", "p_yes": 0.9}])   # not on the table
+
+    client = FakeClient(lead)
+    out = run_desk_cycle(None, sim_engine, cfg, loop, clients={"claude": client}, now=now,
+                         scan_fetch=_scan_rows)
+    assert out["desk"]["status"] == "meeting_held" and out["desk"]["recorded"] == 1
+    with sim_engine.connect() as c:
+        rows = c.execute(select(forecasts.c.ticker, forecasts.c.explanation)
+                         .where(forecasts.c.model_version == dep)).all()
+    assert [(r[0], r[1]["take_profit"], r[1]["stop"]) for r in rows] == [("OK", 0.72, 0.5)]
+    # usage: 6 Opus calls x (10 in, 5 out) + 2 searches
+    assert spend_today(sim_engine, cfg, now) == pytest.approx(
+        meeting_cost(out["desk"]["usage"], cfg)) and spend_today(sim_engine, cfg, now) > 0
+    tight = cfg.model_copy(update={"daily_budget_usd": 0.0001})
+    again = run_desk_cycle(None, sim_engine, tight, loop, clients={"claude": client},
+                           now=now + pd.Timedelta(minutes=30), scan_fetch=_scan_rows)
+    assert again["desk"]["status"] == "meeting_cap_reached"            # budget spent
+    assert next(iter((tmp_path / "r" / "desk-meetings").glob("*ALL*"))).read_text(
+        encoding="utf-8").startswith("[DESK MEETING] desk@ALL-h48") 
+
+
+def test_meeting_falls_back_to_claude_when_gemini_is_down():
+    claude = FakeClient(lambda kw: "c")
+    down = FakeGemini(lambda kw: "g")
+    down.interactions = NS(create=lambda **kw: (_ for _ in ()).throw(ValueError("503")))
+    m = run_meeting({"claude": claude, "gemini": down}, DeskSettings(_env_file=None), "table")
+    assert len(claude.calls) == 6 and m.transcript[0][1].startswith("(gemini unavailable")
+
+
+def test_parse_trades_keeps_sane_exit_levels_only():
+    ds, notes = parse_trades(_lead([
+        {"ticker": "A-1", "action": "BUY", "p_yes": 0.7, "take_profit": 0.8, "stop": 0.5},
+        {"ticker": "B-1", "action": "BUY", "p_yes": 0.7, "take_profit": 0.5, "stop": 0.49},
+        {"ticker": "C-1", "action": "BUY", "p_yes": 0.7}]), ALLOWED, max_buys=3, p_floor=0.02)
+    assert [(d.take_profit, d.stop) for d in ds] == [(0.8, 0.5), (None, None), (None, None)]
+    assert len(notes) == 1 and "B-1" in notes[0]

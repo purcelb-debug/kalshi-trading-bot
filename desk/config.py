@@ -30,8 +30,26 @@ class DeskSettings(BaseSettings):
     gemini_api_key: str = Field(default="", validation_alias=AliasChoices(
         "GEMINI_API_KEY", "gemini_api_key"))
     search_max_uses: int = Field(default=5, ge=1)        # Claude only
-    #: Hard cost cap: meetings per UTC day across ALL desk deployments combined.
-    max_meetings_per_day: int = Field(default=8, ge=1)
+    #: Hard caps per UTC day across ALL desk deployments combined: meetings, and estimated
+    #: LLM spend in dollars (measured token use x ``prices``, plus web searches).
+    max_meetings_per_day: int = Field(default=24, ge=1)
+    daily_budget_usd: float = Field(default=1.0, gt=0)
+    #: $ per million tokens (input, output). Unknown models are priced as Opus to be safe.
+    prices: dict[str, tuple[float, float]] = {
+        "claude-opus-5-5": (4.0, 20.0), "claude-sonnet-5-5": (2.0, 10.0),
+        "gemini-3.8-flash": (0.0, 0.0)}      # free-tier key
+    web_search_usd: float = 0.01
+    #: Broad scan (desk@ALL): markets closing within ``scan_horizon_h`` hours.
+    scan_horizon_h: float = Field(default=48.0, gt=0)
+    scan_min_hours: float = 1.0      # skips 15-minute coin flips a meeting can't keep up with
+    scan_min_mid: float = 0.05
+    scan_max_mid: float = 0.95
+    scan_max_spread: float = 0.06
+    scan_min_volume: float = 100.0
+    scan_per_event: int = Field(default=2, ge=1)
+    scan_max_rows: int = Field(default=40, ge=1)
+    #: Exit levels from the desk are clipped to these price bounds (price of the side held).
+    exit_min_gap: float = Field(default=0.03, gt=0)
     max_picks: int = Field(default=3, ge=1)               # markets the Scanner may pick
     max_buys: int = Field(default=3, ge=0)                # BUYs kept per meeting
     p_floor: float = Field(default=0.02, gt=0, lt=0.5)    # desk p_yes clipped to [floor, 1-floor]

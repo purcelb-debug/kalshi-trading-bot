@@ -86,6 +86,25 @@ def meetings_today(sim: Engine, now) -> int:
             desk_meetings.c.ts >= to_utc(day))).scalar() or 0)
 
 
+def meeting_cost(usage: list[dict], cfg: DeskSettings) -> float:
+    """Estimated dollars for one meeting from its measured token use."""
+    total = 0.0
+    for u in usage or []:
+        p_in, p_out = cfg.prices.get(u.get("model"), cfg.prices["claude-opus-5-5"])
+        total += (u.get("input_tokens", 0) * p_in + u.get("output_tokens", 0) * p_out) / 1e6
+        total += u.get("web_searches", 0) * cfg.web_search_usd
+    return total
+
+
+def spend_today(sim: Engine, cfg: DeskSettings, now) -> float:
+    """Estimated LLM spend today across every desk deployment (the budget is shared)."""
+    day = pd.Timestamp(now).normalize()
+    with sim.connect() as c:
+        rows = c.execute(select(desk_meetings.c.usage_json).where(
+            desk_meetings.c.ts >= to_utc(day))).scalars().all()
+    return sum(meeting_cost(u, cfg) for u in rows)
+
+
 def desk_deployments(sim: Engine) -> list[str]:
     """Registered desk deployments that are still live (not retired)."""
     with sim.connect() as c:
@@ -146,16 +165,24 @@ def opening_text(t: pd.DataFrame, now) -> str:
             "\n\nMARKETS\n" + "\n".join(rows))
 
 
-def _save_transcript(cfg: DeskSettings, deployment: str, now, text: str) -> None:
+def is_broad(params: dict) -> bool:
+    """``desk@ALL``: scans every open market and trades real money through the executor."""
+    return params.get("series") == "ALL"
+
+
+def _save_transcript(cfg: DeskSettings, deployment: str, now, text: str, *,
+                     real_money: bool = False) -> None:
     d = Path(cfg.report_dir) / "desk-meetings"
     d.mkdir(parents=True, exist_ok=True)
-    (d / f"{pd.Timestamp(now):%Y%m%dT%H%M%S}.txt").write_text(
-        f"[DESK MEETING] {deployment}  {pd.Timestamp(now):%Y-%m-%d %H:%M} UTC  PAPER\n\n{text}",
+    tag = "REAL MONEY" if real_money else "PAPER"
+    safe = deployment.replace("@", "_")
+    (d / f"{pd.Timestamp(now):%Y%m%dT%H%M%S}-{safe}.txt").write_text(
+        f"[DESK MEETING] {deployment}  {pd.Timestamp(now):%Y-%m-%d %H:%M} UTC  {tag}\n\n{text}",
         encoding="utf-8")
 
 
 def run_desk_cycle(market: Engine, sim: Engine, cfg: DeskSettings, loop: LoopConfig, *,
-                   clients: dict | None = None, now=None) -> dict:
+                   clients: dict | None = None, now=None, scan_fetch=None) -> dict:
     """One cycle. The meeting runs only when markets newly reach their decision point and
     the daily meeting cap allows; the paper record is refreshed every cycle regardless."""
     init_desk_db(sim)
@@ -166,49 +193,66 @@ def run_desk_cycle(market: Engine, sim: Engine, cfg: DeskSettings, loop: LoopCon
     strategy = StrategyConfig(**{**(dep["validation_json"] or {}).get("strategy", {}),
                                  "initial_cash": loop.paper_cash})
     now = pd.Timestamp(now if now is not None else utcnow())
-    t = market_table(market, sim, cfg, series=params["series"],
-                     horizon=timedelta(hours=params["horizon_h"]), late=loop.late_tolerance,
-                     now=now)
-    if len(t):
-        t = t[~t["ticker"].isin(_shown(sim, loop.deployment))]
+    broad = is_broad(params)
+    if broad:
+        from desk.scan import scan_table, scan_text
+        t = scan_table(cfg, exclude=_shown(sim, loop.deployment), now=now, fetch=scan_fetch)
+    else:
+        t = market_table(market, sim, cfg, series=params["series"],
+                         horizon=timedelta(hours=params["horizon_h"]),
+                         late=loop.late_tolerance, now=now)
+        if len(t):
+            t = t[~t["ticker"].isin(_shown(sim, loop.deployment))]
     meeting, recorded, status = None, 0, "no_new_markets"
-    if len(t) and meetings_today(sim, now) >= cfg.max_meetings_per_day:
+    spent = spend_today(sim, cfg, now) if len(t) else 0.0
+    if len(t) and (meetings_today(sim, now) >= cfg.max_meetings_per_day
+                   or spent >= cfg.daily_budget_usd):
         status = "meeting_cap_reached"
         log_event(sim, "desk", "warning", f"meeting cap reached {loop.deployment}",
-                  {"cap": cfg.max_meetings_per_day, "waiting": t["ticker"].tolist()}, ts=now)
+                  {"cap": cfg.max_meetings_per_day, "budget_usd": cfg.daily_budget_usd,
+                   "spent_usd": round(spent, 4), "waiting": t["ticker"].tolist()}, ts=now)
     elif len(t):
         if clients is None:
             from desk.llm import make_client
             clients = {p: make_client(cfg, p) for p in providers(cfg)}
-        meeting = run_meeting(clients, cfg, opening_text(t, now))
+        meeting = run_meeting(clients, cfg, scan_text(t, now) if broad else opening_text(t, now))
         decisions, notes = parse_trades(meeting.lead_text,
                                         dict(zip(t["ticker"], t["event_ticker"])),
-                                        max_buys=cfg.max_buys, p_floor=cfg.p_floor)
+                                        max_buys=cfg.max_buys, p_floor=cfg.p_floor,
+                                        exit_gap=cfg.exit_min_gap)
         mids = dict(zip(t["ticker"], t["market_mid"]))
         items = [Forecast(ticker=d.ticker, model_version=loop.deployment, p=d.p_yes,
                           ci_low=None, ci_high=None, input_max_ts=now, decision_ts=now,
-                          dq_flags=(), explanation={"desk": d.reason, "side": d.side})
+                          dq_flags=(), explanation={"desk": d.reason, "side": d.side,
+                                                    "take_profit": d.take_profit,
+                                                    "stop": d.stop})
                  for d in decisions]
         ref = {k: float(v) for k, v in mids.items() if pd.notna(v)}
         recorded = record_forecasts(sim, items, market_ref=ref, created_ts=now) if items else 0
         text = meeting.text() + "\n\n[SYSTEM]\n" + "\n".join(
-            [f"recorded BUY {d.ticker} p_yes={d.p_yes:.2f} (sized by code)" for d in decisions]
-            + notes + ([] if decisions or notes else ["no trades"]))
+            [f"recorded BUY {d.ticker} p_yes={d.p_yes:.2f} take_profit={d.take_profit} "
+             f"stop={d.stop} (sized and placed by code)" for d in decisions]
+            + notes + ([] if decisions or notes else ["no trades"])
+            + [f"est. cost ${meeting_cost(meeting.usage, cfg):.3f}"])
         with sim.begin() as c:
             c.execute(desk_meetings.insert().values(
                 deployment=loop.deployment, ts=now.to_pydatetime(),
                 tickers_json=t["ticker"].tolist(),
                 decisions_json=[asdict(d) for d in decisions], notes_json=notes,
                 usage_json=meeting.usage, transcript=text))
-        _save_transcript(cfg, loop.deployment, now, text)
+        _save_transcript(cfg, loop.deployment, now, text, real_money=broad)
         status = "meeting_held"
+    desk_out = {"status": status, "recorded": recorded, "usage": meeting.usage if meeting else []}
+    if broad:
+        # Scanned markets aren't in the research database, so there is no paper replay:
+        # this deployment's record is the executor's ledger (real fills and settlements).
+        return {"status": "ok", "deployment": loop.deployment, "gate": None, "desk": desk_out}
     with sim.connect() as c:
         prior = int(c.execute(select(func.count(func.distinct(forecasts.c.ticker))).where(
             forecasts.c.model_version == loop.deployment)).scalar() or 0) - recorded
     out = update_paper_record(market, sim, loop, dep, now=now, strategy=strategy,
                               new_forecasts=recorded, prior_forecasts=prior)
-    out["desk"] = {"status": status, "recorded": recorded,
-                   "usage": meeting.usage if meeting else []}
+    out["desk"] = desk_out
     return out
 
 

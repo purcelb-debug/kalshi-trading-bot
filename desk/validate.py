@@ -18,6 +18,8 @@ class _Row(BaseModel):
     p_yes: float | None = None
     side: str = ""
     reason: str = ""
+    take_profit: float | None = None     # price of the side bought, to sell at or above
+    stop: float | None = None            # price of the side bought, to sell at or below
 
     @field_validator("action")
     @classmethod
@@ -31,10 +33,22 @@ class Decision:
     p_yes: float
     side: str
     reason: str
+    take_profit: float | None = None
+    stop: float | None = None
+
+
+def _exits(r: _Row, gap: float) -> tuple[float | None, float | None, str]:
+    """Clip exit levels to tradable prices; drop both unless stop + gap <= take_profit."""
+    if r.take_profit is None or r.stop is None:
+        return None, None, ""
+    tp, st = min(max(r.take_profit, 0.02), 0.99), min(max(r.stop, 0.01), 0.98)
+    if st + gap > tp:
+        return None, None, f"{r.ticker}: exit levels {r.stop}/{r.take_profit} unusable, held to settlement"
+    return round(tp, 2), round(st, 2), ""
 
 
 def parse_trades(lead_text: str, allowed: dict[str, str], *, max_buys: int,
-                 p_floor: float) -> tuple[list[Decision], list[str]]:
+                 p_floor: float, exit_gap: float = 0.03) -> tuple[list[Decision], list[str]]:
     """(BUY decisions to record, notes on everything dropped). ``allowed`` maps each ticker
     shown to the desk to its event. Malformed output means no trades."""
     try:
@@ -67,5 +81,8 @@ def parse_trades(lead_text: str, allowed: dict[str, str], *, max_buys: int,
             continue
         events.add(allowed[r.ticker])
         p = min(max(r.p_yes, p_floor), 1.0 - p_floor)
-        out.append(Decision(r.ticker, p, r.side.lower(), r.reason[:300]))
+        tp, st, why = _exits(r, exit_gap)
+        if why:
+            notes.append(why)
+        out.append(Decision(r.ticker, p, r.side.lower(), r.reason[:300], tp, st))
     return out, notes

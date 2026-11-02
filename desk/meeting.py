@@ -95,9 +95,18 @@ def run_meeting(clients: dict, cfg: DeskSettings, opening: str,
     for name, key, search, skeptic in ROLES:
         prov = cfg.search_provider if search else cfg.provider
         model = cfg.skeptic_model if skeptic else cfg.search_model if search else cfg.model
-        msg, usage = backends[prov](clients[prov], cfg, name, prompts[key], chat, model=model,
-                                    effort=cfg.skeptic_effort if skeptic else cfg.effort,
-                                    search=search)
+        effort = cfg.skeptic_effort if skeptic else cfg.effort
+        try:
+            msg, usage = backends[prov](clients[prov], cfg, name, prompts[key], chat,
+                                        model=model, effort=effort, search=search)
+        except Exception as e:
+            other = "claude" if prov == "gemini" else "gemini"
+            if other not in clients:
+                raise
+            alt = cfg.search_model if other == cfg.search_provider else cfg.model
+            msg, usage = backends[other](clients[other], cfg, name, prompts[key], chat,
+                                         model=alt, effort=effort, search=search)
+            msg = f"({prov} unavailable: {type(e).__name__}; answered on {other})\n" + msg
         m.transcript.append((name, msg))
         m.usage += usage
         chat += f"\n\n[{name}]\n{msg}"

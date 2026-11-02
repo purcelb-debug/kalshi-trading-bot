@@ -17,11 +17,14 @@ PAPER_ONLY = [               # paper loop only: no model here has beaten the mar
     "market_implied+platt-5e74e39fb3@KXHIGHCHI-h30",
     "market_implied+platt-5e74e39fb3@KXHIGHMIA-h30",
 ]
+DESK_LIVE = [                # LLM desk deployments the executor trades (exits + buys)
+    "desk@ALL-h48",
+]
 PY = ROOT / ".venv" / "Scripts" / "python.exe"
 STEPS = (
     [["-m", "predlab.cli", "loop", "--deployment", d, "--once"] for d in LIVE + PAPER_ONLY]
     + [["-m", "desk.cli", "cycle", "--all"]]    # LLM desk; a no-op until `desk.cli register`
-    + [["-m", "executor.cli", "run", "--model-version", d] for d in LIVE]
+    + [["-m", "executor.cli", "run", "--model-version", d] for d in LIVE + DESK_LIVE]
     + [["-m", "executor.cli", "sync"],
        ["-m", "notify.cli", "digest"]]          # phone alerts; a no-op until notify/.env is set
 )

@@ -70,6 +70,11 @@ def _audit_line(rec: dict, seen: dict) -> str | None:
                 f"(order {rec.get('order_id')})")
     if ev == "order_error":
         return f"ORDER ERROR {rec.get('ticker')}: {rec.get('error')}"
+    if ev == "exit_ack" and rec.get("fill_count"):
+        return (f"SOLD ({rec.get('reason')}) {rec['fill_count']:g} @ avg "
+                f"{rec.get('average_fill_price')} (order {rec.get('order_id')})")
+    if ev == "exit_error":
+        return f"EXIT ERROR {rec.get('ticker')}: {rec.get('error')}"
     if ev == "order_blocked":
         return f"blocked {rec.get('ticker')}: {rec.get('reason')}"
     if ev == "cycle_end" and rec.get("halted"):

@@ -14,6 +14,7 @@ from sqlalchemy import Engine, func, select
 
 from executor.client import KalshiTradingClient, TradingError
 from executor.config import BASE_URLS, ExecutorSettings
+from executor.exits import exit_levels, plan_exit
 from executor.gate import certified_shrink, load_gate
 from executor.safety import AuditLog, State, pre_trade_check, startup_checks
 from predlab.backtest.decision import Plan, plan_order
@@ -89,11 +90,50 @@ def run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, *,
     audit.write("cycle_start", mode=cfg.mode, model_version=model_version, cash=cash,
                 portfolio_value=port_value, open_exposure=sum(exposure.values()))
 
+    # Exits first: close positions this deployment opened whose take-profit or stop was hit.
+    levels = exit_levels(sim_engine, model_version)
+    held = [p for p in positions if p["ticker"] in levels]
+    if held and client is not None:
+        books = quotes if quotes is not None else asyncio.run(fetch_quotes(
+            BASE_URLS["demo" if cfg.mode == "demo" else "live"], [p["ticker"] for p in held]))
+        for p in held:
+            q = books.get(p["ticker"])
+            if q is not None and (utcnow() - q.ts).total_seconds() > cfg.max_quote_age_s:
+                q = None
+            ex = plan_exit(p, levels[p["ticker"]], q)
+            if ex is None:
+                continue
+            audit.write("exit_submit", mode=cfg.mode, plan=ex.__dict__)
+            try:
+                ack = client.place_ioc_exit(ex.ticker, ex.held, ex.count, ex.min_price)
+            except (TradingError, OSError) as e:
+                state.consecutive_errors += 1
+                audit.write("exit_error", ticker=ex.ticker, error=str(e))
+                results.append({"ticker": ex.ticker, "status": "exit_error", "reason": str(e)})
+                if state.consecutive_errors >= cfg.max_consecutive_errors:
+                    state.halted = f"{state.consecutive_errors} consecutive order errors"
+                    break
+                continue
+            state.consecutive_errors = 0
+            state.orders_today += 1
+            audit.write("exit_ack", reason=ex.reason, **ack.__dict__)
+            if ack.fill_count:
+                state.closed = sorted({*state.closed, ex.ticker})
+                cash += ack.fill_count * ex.min_price
+                if ack.fill_count >= ex.count:
+                    exposure.pop(ex.ticker, None)
+            results.append({"ticker": ex.ticker, "status": "exited" if ack.fill_count
+                            else "exit_unfilled", "reason": ex.reason, "filled": ack.fill_count})
+        if state.halted:
+            state.save(state_path)
+            audit.write("cycle_end", results=len(results), halted=state.halted)
+            return results
+
     fc = latest_forecasts(sim_engine, model_version, forecast_max_age_h)
     if fc.empty:
         audit.write("no_forecasts", model_version=model_version)
         state.save(state_path)
-        return [{"status": "no_forecasts"}]
+        return results + [{"status": "no_forecasts"}]
     if quotes is None:
         quotes = asyncio.run(fetch_quotes(BASE_URLS["demo" if cfg.mode == "demo" else "live"],
                                           fc["ticker"].tolist()))
@@ -103,6 +143,9 @@ def run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, *,
     kappa = certified_shrink(sim_engine, model_version)
     shrink = cfg.shrink if kappa is None else min(cfg.shrink, kappa)
     for r in fc.itertuples():
+        if r.ticker in state.closed:
+            results.append({"ticker": r.ticker, "status": "skipped", "reason": "exited earlier"})
+            continue
         if exposure.get(r.ticker, 0.0) > 0:
             # One decision per market, as in the backtest: never add to a held position.
             results.append({"ticker": r.ticker, "status": "skipped", "reason": "already held"})

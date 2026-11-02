@@ -21,6 +21,7 @@ class State:
     consecutive_errors: int = 0
     halted: str = ""                      # non-empty = halted, with the reason
     history: list = field(default_factory=list)
+    closed: list = field(default_factory=list)   # tickers sold by an exit: never re-bought
 
     @classmethod
     def load(cls, path: Path) -> "State":

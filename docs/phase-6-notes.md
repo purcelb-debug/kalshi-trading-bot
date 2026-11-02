@@ -88,3 +88,26 @@ held position, a statistical go-live gate). Only the parts that filled gaps were
   each of KXHIGHNY, KXHIGHCHI and KXHIGHMIA: 30h before close (about 7-8 PM ET the day before)
   and 12h before close (about 1-2 PM ET on the day). Each horizon is its own paper record,
   and a market is shown once per horizon. That's 6 meetings a day, inside the shared cap of 8.
+
+## 2026-11-02: closer to the DESK post (owner's choices)
+- **`desk@ALL-h48`** scans every open Kalshi market closing within 48h (~10,000; ~500 pass
+  the filters: both sides quoted, mid 0.05-0.95, spread <= 6c, volume >= 100, >= 1h to close)
+  and shows the desk the top 40 by 24h volume, at most 2 per event. Each market is shown
+  once. There is no paper replay: these markets aren't in the research database, so its
+  record is the executor ledger.
+- **The desk trades real money**: `scripts/run_loop.py` runs the executor on `desk@ALL-h48`
+  after each desk cycle, under the gate override, with all the shared caps.
+- **Exits**: the Pricer sets take_profit / stop (prices of the side bought), and the Lead
+  passes them in TRADES. Code clips them and drops both unless stop + 3c <= take_profit.
+  Every executor cycle checks held positions for that deployment before buying, and sends
+  an IOC `reduce_only` sell at the current bid when the bid is at or above take_profit, or at
+  or below stop. Exited tickers are never bought again (`State.closed`). Telegram reports
+  SOLD lines. The paper engine still holds to settlement.
+- **Cadence and cost**: the job runs every 30 minutes. Desk limits per UTC day, shared by all
+  desk deployments: 24 meetings and `DESK_DAILY_BUDGET_USD` (default $1), estimated from
+  measured token use x `DESK_PRICES` plus $0.01 per web search. Each transcript ends with
+  its estimated cost.
+- **Reliability**: Gemini calls retry 503/429/connection errors (2s, 6s, 15s). A role whose
+  provider still fails is answered by the other provider, and the transcript notes it.
+  Claude clients use 4 retries.
+
