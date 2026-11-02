@@ -11,6 +11,15 @@ from notify.telegram import send
 app = typer.Typer(add_completion=False, help="Outbound-only phone notifications.")
 
 
+@app.callback()
+def _main():
+    # The scheduled job logs to a file in the Windows code page; LLM transcripts contain
+    # characters it can't encode, and a crash here would block every later message.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def _deliver(cfg: NotifySettings, messages: list[str], dry: bool) -> bool:
     ok = True
     for m in messages:

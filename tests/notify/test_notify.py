@@ -126,3 +126,24 @@ def test_standing_gate_override_reported_once_across_cycles(tmp_path):
     log.write("cycle_start", mode="live")
     log.write("gate_overridden", reasons=["registry status is 'candidate'"])
     assert build_messages(cfg, state, NOW, _exec()) == []
+
+
+def test_digest_survives_a_non_utf8_console(tmp_path):
+    """The scheduled job logs in the Windows code page; a transcript with characters it
+    can't encode once crashed the digest before sending, blocking every later message."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    d = tmp_path / "reports" / "desk-meetings"
+    d.mkdir(parents=True)
+    (d / "20261102T190734-desk_X.txt").write_text("[DESK MEETING] edge ≤ 3c → WAIT",
+                                                   encoding="utf-8")
+    env = {**os.environ, "PYTHONIOENCODING": "cp1252", "TELEGRAM_BOT_TOKEN": "",
+           "TELEGRAM_CHAT_ID": "", "REPORT_DIR": str(tmp_path / "reports"),
+           "EXECUTOR_DATA_DIR": str(tmp_path / "ex"), "STATE_PATH": str(tmp_path / "s.json")}
+    root = Path(__file__).resolve().parents[2]
+    r = subprocess.run([sys.executable, "-m", "notify.cli", "digest", "--dry"], cwd=root,
+                       env=env, capture_output=True, timeout=120, check=False)
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")[-500:]
+    assert "≤".encode() in r.stdout
