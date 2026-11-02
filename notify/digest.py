@@ -9,6 +9,7 @@ is sent once. Only events worth a phone buzz are sent; quiet cycles send nothing
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from executor.config import ExecutorSettings
 from executor.gate import evaluate_gate
@@ -137,6 +138,29 @@ def _desk_messages(cfg: NotifySettings, state: dict) -> list[str]:
     return [p.read_text(encoding="utf-8") for p in new]
 
 
+def _target_messages(cfg: NotifySettings, state: dict, now: datetime) -> list[str]:
+    """Once per day, yesterday's profit against the owner's daily target."""
+    from executor.ledger import daily_pnl, load
+    try:
+        _, _, b = load(cfg.executor_data_dir)
+    except Exception:  # noqa: BLE001 - no ledger yet: nothing to grade
+        return []
+    d = daily_pnl(b).dropna(subset=["pnl"])
+    today = now.astimezone(ZoneInfo("America/New_York")).date()
+    done = d[d["day"] < today]
+    if done.empty or state.get("target_day") == str(done["day"].iloc[-1]):
+        return []
+    last = done.iloc[-1]
+    state["target_day"] = str(last["day"])
+    week = done.tail(7)
+    met = int((week["pnl"] >= cfg.daily_target_usd).sum())
+    verdict = "MET" if last["pnl"] >= cfg.daily_target_usd else "MISSED"
+    return [(f"[DAILY TARGET] {last['day']}: {verdict} - made ${last['pnl']:+.2f} vs "
+             f"${cfg.daily_target_usd:.2f} target (account ${last['equity_close']:.2f}).\n"
+             f"Last {len(week)} day(s): avg ${week['pnl'].mean():+.2f}/day, target met {met} "
+             f"of {len(week)}.")]
+
+
 def build_messages(cfg: NotifySettings, state: dict, now: datetime | None = None,
                    exec_cfg: ExecutorSettings | None = None) -> list[str]:
     """Messages to send now; mutates ``state`` to mark them sent."""
@@ -144,4 +168,5 @@ def build_messages(cfg: NotifySettings, state: dict, now: datetime | None = None
     exec_cfg = exec_cfg or ExecutorSettings()
     return (_loop_messages(cfg, state, now, exec_cfg.gate_paper_weeks,
                            exec_cfg.gate_min_paper_trades)
-            + _executor_messages(cfg, state) + _desk_messages(cfg, state))
+            + _executor_messages(cfg, state) + _desk_messages(cfg, state)
+            + _target_messages(cfg, state, now))

@@ -16,6 +16,9 @@ class NotifySettings(BaseSettings):
     telegram_chat_id: str = ""
     stale_after_hours: float = 2.0          # warn when the loop report is older than this
     report_dir: str = str(ROOT / "reports")
+    #: Owner's success baseline (2026-11-02): the account must make at least this many
+    #: dollars per day. Reported daily and weekly; it never changes how the bot trades.
+    daily_target_usd: float = 8.0
     executor_data_dir: str = str(ROOT / "executor" / "data")
     state_path: str = str(ROOT / "data" / "notify_state.json")
 

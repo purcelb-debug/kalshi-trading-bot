@@ -29,7 +29,12 @@ class DeskSettings(BaseSettings):
     skeptic_effort: str = "high"
     gemini_api_key: str = Field(default="", validation_alias=AliasChoices(
         "GEMINI_API_KEY", "gemini_api_key"))
-    search_max_uses: int = Field(default=5, ge=1)        # Claude only
+    search_max_uses: int = Field(default=3, ge=1)        # Claude only
+    #: Time limits so one slow call can't eat the job's step: per LLM request, and per meeting
+    #: (the meeting stops after the role that crosses it and is recorded as aborted).
+    call_timeout_s: float = Field(default=180.0, gt=0)
+    meeting_deadline_s: float = Field(default=600.0, gt=0)
+    max_meetings_per_cycle: int = Field(default=2, ge=1)
     #: Hard caps per UTC day across ALL desk deployments combined: meetings, and estimated
     #: LLM spend in dollars (measured token use x ``prices``, plus web searches).
     max_meetings_per_day: int = Field(default=24, ge=1)
@@ -47,7 +52,7 @@ class DeskSettings(BaseSettings):
     scan_max_spread: float = 0.06
     scan_min_volume: float = 100.0
     scan_per_event: int = Field(default=2, ge=1)
-    scan_max_rows: int = Field(default=40, ge=1)
+    scan_max_rows: int = Field(default=20, ge=1)
     #: Exit levels from the desk are clipped to these price bounds (price of the side held).
     exit_min_gap: float = Field(default=0.03, gt=0)
     max_picks: int = Field(default=3, ge=1)               # markets the Scanner may pick

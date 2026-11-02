@@ -56,10 +56,12 @@ def cycle(deployment: str = typer.Option("desk@KXHIGHNY-h30"),
     cfg, (market, sim) = DeskSettings(), _engines()
     if all_:
         # One failing market must not stop the others; the exit code still reports it.
-        failed = []
+        failed, held = [], 0
         for dep in desk_deployments(sim):
             try:
-                out = run_desk_cycle(market, sim, cfg, LoopConfig(dep, report_dir=cfg.report_dir))
+                out = run_desk_cycle(market, sim, cfg, LoopConfig(dep, report_dir=cfg.report_dir),
+                                     allow_meeting=held < cfg.max_meetings_per_cycle)
+                held += out["desk"]["status"] in ("meeting_held", "meeting_aborted")
                 typer.echo(json.dumps({"deployment": dep, "desk": out["desk"]}, default=str))
             except Exception as e:  # noqa: BLE001 - reported, then the next market runs
                 failed.append(dep)

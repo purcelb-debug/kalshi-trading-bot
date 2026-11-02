@@ -147,3 +147,23 @@ def test_digest_survives_a_non_utf8_console(tmp_path):
                        env=env, capture_output=True, timeout=120, check=False)
     assert r.returncode == 0, r.stderr.decode("utf-8", "replace")[-500:]
     assert "≤".encode() in r.stdout
+
+
+def test_daily_target_reported_once_per_finished_day(tmp_path):
+    from executor.ledger import _upsert, balances, ledger_engine
+    eng = ledger_engine(str(tmp_path))
+    snaps = [("2026-11-02T14:00:00Z", 40.0), ("2026-11-03T02:00:00Z", 42.0),   # Nov 2 ET close 42
+             ("2026-11-03T20:00:00Z", 51.5), ("2026-11-04T15:00:00Z", 51.0)]
+    _upsert(eng, balances, [{"ts": datetime.fromisoformat(t), "cash": v,
+                             "positions_value": 0.0} for t, v in snaps])
+    eng.dispose()
+    cfg = NotifySettings(_env_file=None, report_dir=str(tmp_path / "r"),
+                         executor_data_dir=str(tmp_path), daily_target_usd=8.0)
+    state = {}
+    now = datetime(2026, 11, 4, 16, 0, tzinfo=UTC)
+    msgs = [m for m in build_messages(cfg, state, now=now, exec_cfg=ExecutorSettings(
+        _env_file=None)) if m.startswith("[DAILY TARGET]")]
+    assert msgs == [("[DAILY TARGET] 2026-11-03: MET - made $+9.50 vs $8.00 target "
+                    "(account $51.50).\nLast 1 day(s): avg $+9.50/day, target met 1 of 1.")]
+    again = build_messages(cfg, state, now=now, exec_cfg=ExecutorSettings(_env_file=None))
+    assert not any(m.startswith("[DAILY TARGET]") for m in again)      # once per day

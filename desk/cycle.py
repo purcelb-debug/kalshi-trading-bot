@@ -182,7 +182,8 @@ def _save_transcript(cfg: DeskSettings, deployment: str, now, text: str, *,
 
 
 def run_desk_cycle(market: Engine, sim: Engine, cfg: DeskSettings, loop: LoopConfig, *,
-                   clients: dict | None = None, now=None, scan_fetch=None) -> dict:
+                   clients: dict | None = None, now=None, scan_fetch=None,
+                   allow_meeting: bool = True) -> dict:
     """One cycle. The meeting runs only when markets newly reach their decision point and
     the daily meeting cap allows; the paper record is refreshed every cycle regardless."""
     init_desk_db(sim)
@@ -211,6 +212,8 @@ def run_desk_cycle(market: Engine, sim: Engine, cfg: DeskSettings, loop: LoopCon
         log_event(sim, "desk", "warning", f"meeting cap reached {loop.deployment}",
                   {"cap": cfg.max_meetings_per_day, "budget_usd": cfg.daily_budget_usd,
                    "spent_usd": round(spent, 4), "waiting": t["ticker"].tolist()}, ts=now)
+    elif len(t) and not allow_meeting:
+        status = "deferred"          # this run already held its meetings; next run
     elif len(t):
         if clients is None:
             from desk.llm import make_client
@@ -232,6 +235,7 @@ def run_desk_cycle(market: Engine, sim: Engine, cfg: DeskSettings, loop: LoopCon
         text = meeting.text() + "\n\n[SYSTEM]\n" + "\n".join(
             [f"recorded BUY {d.ticker} p_yes={d.p_yes:.2f} take_profit={d.take_profit} "
              f"stop={d.stop} (sized and placed by code)" for d in decisions]
+            + ([f"ABORTED: {meeting.aborted}; no trades"] if meeting.aborted else [])
             + notes + ([] if decisions or notes else ["no trades"])
             + [f"est. cost ${meeting_cost(meeting.usage, cfg):.3f}"])
         with sim.begin() as c:
@@ -241,7 +245,7 @@ def run_desk_cycle(market: Engine, sim: Engine, cfg: DeskSettings, loop: LoopCon
                 decisions_json=[asdict(d) for d in decisions], notes_json=notes,
                 usage_json=meeting.usage, transcript=text))
         _save_transcript(cfg, loop.deployment, now, text, real_money=broad)
-        status = "meeting_held"
+        status = "meeting_aborted" if meeting.aborted else "meeting_held"
     desk_out = {"status": status, "recorded": recorded, "usage": meeting.usage if meeting else []}
     if broad:
         # Scanned markets aren't in the research database, so there is no paper replay:

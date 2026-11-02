@@ -110,4 +110,15 @@ held position, a statistical go-live gate). Only the parts that filled gaps were
 - **Reliability**: Gemini calls retry 503/429/connection errors (2s, 6s, 15s). A role whose
   provider still fails is answered by the other provider, and the transcript notes it.
   Claude clients use 4 retries.
+- **Meeting limits (after the first broad meeting hit the 20-minute step timeout):** 20-row
+  table, at most 3 searches per searching role, 180s per LLM request, 10-minute meeting
+  deadline, at most 2 meetings per job run (others are "deferred" to the next run), and a
+  28-minute limit for the desk step. A meeting that stops early (deadline, or both providers
+  down) is still recorded: its spend counts toward the budget, its markets count as seen,
+  and a partial transcript is never parsed for trades.
+- **Success baseline (owner, 2026-11-02): at least $8 profit per day.** Measured as the
+  change in account value (cash + positions) from one ET day's last balance snapshot to
+  the next. Telegram sends a daily MET/MISSED line with the 7-day average. Deposits and
+  withdrawals move the number too (the Nov 1 deposit shows as +$25.59). The target is a
+  measurement only and never changes sizing or limits.
 

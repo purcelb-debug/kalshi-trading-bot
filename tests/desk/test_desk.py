@@ -334,3 +334,50 @@ def test_parse_trades_keeps_sane_exit_levels_only():
         {"ticker": "C-1", "action": "BUY", "p_yes": 0.7}]), ALLOWED, max_buys=3, p_floor=0.02)
     assert [(d.take_profit, d.stop) for d in ds] == [(0.8, 0.5), (None, None), (None, None)]
     assert len(notes) == 1 and "B-1" in notes[0]
+
+
+def test_meeting_stops_at_deadline_and_never_parses_a_partial_transcript():
+    ticks = iter([0, 0, 100, 700, 700, 700, 700])          # passes 600s before PRICER
+    c = FakeClient(lambda kw: "TRADES:\n" + json.dumps([{"ticker": "A-1", "action": "BUY",
+                                                          "p_yes": 0.9}]))
+    m = run_meeting({"claude": c}, _claude(), "table", clock=lambda: next(ticks))
+    assert [r for r, _ in m.transcript] == ["SCANNER", "NEWS"] and "deadline" in m.aborted
+    assert m.lead_text == "" and len(m.usage) == 2                 # spend kept, no trades
+
+
+def test_meeting_aborts_when_both_providers_fail():
+    def boom(**kw):
+        raise ValueError("down")
+    claude, gem = FakeClient(lambda kw: "c"), FakeGemini(lambda kw: "g")
+    claude.beta = NS(messages=NS(create=boom))
+    gem.interactions = NS(create=boom)
+    m = run_meeting({"claude": claude, "gemini": gem}, DeskSettings(_env_file=None), "table")
+    assert m.transcript == [] and "SCANNER failed" in m.aborted
+
+
+def test_aborted_meeting_is_recorded_with_its_cost_and_markets(sim_engine, tmp_path):
+    cfg = _claude(report_dir=str(tmp_path / "r"), meeting_deadline_s=1.0)
+    dep = register_desk(sim_engine, cfg, series="ALL", horizon_h=48)
+    loop = LoopConfig(dep, report_dir=cfg.report_dir)
+    now = pd.Timestamp("2026-11-02 12:00", tz="UTC")
+    ticks = iter([0.0, 0.0, 5.0] + [5.0] * 20)
+    import desk.meeting as dm
+    real = dm.time.monotonic
+    dm.time.monotonic = lambda: next(ticks)
+    try:
+        out = run_desk_cycle(None, sim_engine, cfg, loop, clients={"claude": FakeClient(
+            lambda kw: "notes")}, now=now, scan_fetch=_scan_rows)
+    finally:
+        dm.time.monotonic = real
+    assert out["desk"]["status"] == "meeting_aborted" and out["desk"]["recorded"] == 0
+    with sim_engine.connect() as c:
+        row = c.execute(select(desk_meetings.c.tickers_json, desk_meetings.c.usage_json,
+                               desk_meetings.c.transcript)).one()
+    assert row[0] == ["SEEN", "BIG-0", "BIG-1", "OK"] and len(row[1]) == 1 and "ABORTED" in row[2]
+    later = run_desk_cycle(None, sim_engine, cfg, loop, clients={"claude": FakeClient(
+        lambda kw: "x")}, now=now, scan_fetch=_scan_rows, allow_meeting=False)
+    assert later["desk"]["status"] == "deferred"          # per-run meeting limit respected
+    from desk.cycle import _shown
+    from desk.scan import filter_rank
+    rest = filter_rank(pd.DataFrame(_scan_rows()), cfg, exclude=_shown(sim_engine, dep), now=now)
+    assert rest["ticker"].tolist() == ["BIG-2", "BIG-3"]          # aborted markets count as seen

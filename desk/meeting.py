@@ -9,6 +9,7 @@ anything; the transcript is just text for ``desk.validate`` to parse.
 """
 
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -30,10 +31,15 @@ MAX_CONTINUATIONS = 5
 class Meeting:
     transcript: list[tuple[str, str]] = field(default_factory=list)
     usage: list[dict] = field(default_factory=list)
+    aborted: str = ""            # non-empty: the meeting stopped early, with the reason
 
     @property
     def lead_text(self) -> str:
-        return self.transcript[-1][1] if self.transcript else ""
+        """The Desk Lead's message, or "" if the meeting never reached the Lead (so a
+        partial transcript can never be parsed as trades)."""
+        if self.aborted or not self.transcript or self.transcript[-1][0] != "DESK LEAD":
+            return ""
+        return self.transcript[-1][1]
 
     def text(self) -> str:
         return "\n\n".join(f"[{name}]\n{msg}" for name, msg in self.transcript)
@@ -66,7 +72,7 @@ def ask(client, cfg: DeskSettings, role: str, system: str, chat: str, *, model: 
     messages = [{"role": "user", "content": chat}]
     usage, text = [], []
     for _ in range(MAX_CONTINUATIONS + 1):
-        resp = client.beta.messages.create(messages=messages, **kw)
+        resp = client.beta.messages.create(messages=messages, timeout=cfg.call_timeout_s, **kw)
         usage.append(_usage(resp, role))
         if resp.stop_reason == "refusal":
             return "(declined to answer; treat as no opinion)", usage
@@ -84,28 +90,36 @@ def providers(cfg: DeskSettings) -> set[str]:
 
 
 def run_meeting(clients: dict, cfg: DeskSettings, opening: str,
-                prompts: dict | None = None) -> Meeting:
+                prompts: dict | None = None, clock=None) -> Meeting:
     """Run the six roles over ``opening`` (the code-built market table). ``clients`` maps
     each provider in ``providers(cfg)`` to its SDK client."""
     from desk import gemini
 
     backends = {"claude": ask, "gemini": gemini.ask}
     prompts = prompts or load_prompts(cfg)
-    m, chat = Meeting(), opening
+    clock = clock or time.monotonic
+    m, chat, started = Meeting(), opening, clock()
     for name, key, search, skeptic in ROLES:
+        if clock() - started > cfg.meeting_deadline_s:
+            m.aborted = f"meeting deadline {cfg.meeting_deadline_s:g}s passed before {name}"
+            break
         prov = cfg.search_provider if search else cfg.provider
         model = cfg.skeptic_model if skeptic else cfg.search_model if search else cfg.model
         effort = cfg.skeptic_effort if skeptic else cfg.effort
         try:
             msg, usage = backends[prov](clients[prov], cfg, name, prompts[key], chat,
                                         model=model, effort=effort, search=search)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - one provider down: the other answers
             other = "claude" if prov == "gemini" else "gemini"
-            if other not in clients:
-                raise
             alt = cfg.search_model if other == cfg.search_provider else cfg.model
-            msg, usage = backends[other](clients[other], cfg, name, prompts[key], chat,
-                                         model=alt, effort=effort, search=search)
+            try:
+                if other not in clients:
+                    raise
+                msg, usage = backends[other](clients[other], cfg, name, prompts[key], chat,
+                                             model=alt, effort=effort, search=search)
+            except Exception as e2:  # noqa: BLE001 - both down: stop, keep what was spent
+                m.aborted = f"{name} failed: {type(e).__name__}; fallback {type(e2).__name__}"
+                break
             msg = f"({prov} unavailable: {type(e).__name__}; answered on {other})\n" + msg
         m.transcript.append((name, msg))
         m.usage += usage

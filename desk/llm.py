@@ -18,6 +18,6 @@ def make_client(cfg: DeskSettings, provider: str):
     from predlab.config import get_settings
 
     key = get_settings().anthropic_api_key
-    # More retries than the SDK default: dropped connections and 529s are usually brief.
-    return (anthropic.Anthropic(api_key=key, max_retries=4) if key
-            else anthropic.Anthropic(max_retries=4))
+    # Retries for dropped connections and 529s; each attempt is bounded by call_timeout_s.
+    return (anthropic.Anthropic(api_key=key, max_retries=2) if key
+            else anthropic.Anthropic(max_retries=2))

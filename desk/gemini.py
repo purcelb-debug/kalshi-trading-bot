@@ -41,6 +41,7 @@ def _usage(resp, role: str, model: str) -> dict:
 def ask(client, cfg: DeskSettings, role: str, system: str, chat: str, *, model: str,
         effort: str, search: bool) -> tuple[str, list[dict]]:
     kw = {"model": model, "input": chat, "system_instruction": system, "store": False,
+          "timeout": cfg.call_timeout_s,
           "generation_config": {"thinking_level": effort, "max_output_tokens": 16000}}
     note = ""
     if search:

@@ -164,6 +164,21 @@ def _bot_order_ids(data_dir: str) -> set[str]:
     if path.exists():
         for line in path.read_text(encoding="utf-8").splitlines():
             e = json.loads(line)
-            if e.get("event") == "order_ack" and e.get("order_id"):
+            if e.get("event") in ("order_ack", "exit_ack") and e.get("order_id"):
                 ids.add(e["order_id"])
     return ids
+
+
+def daily_pnl(b, tz: str = "America/New_York"):
+    """Profit per local calendar day = change in account value (cash + positions) from the
+    last snapshot of the previous day to the last snapshot of this day. Counts settlements,
+    early sells and open-position moves alike. Deposits and withdrawals also move it, so a
+    transfer shows up as profit or loss on that day."""
+    import pandas as pd
+    if b.empty:
+        return pd.DataFrame(columns=["day", "equity_close", "pnl"])
+    eq = b.assign(day=b["ts"].dt.tz_convert(tz).dt.date).groupby("day")["equity"].last()
+    out = eq.to_frame("equity_close").reset_index()
+    out["pnl"] = out["equity_close"].diff()
+    return out
+

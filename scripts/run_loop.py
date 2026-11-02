@@ -42,7 +42,7 @@ def main() -> int:
             try:
                 code = subprocess.run([str(PY), *step], check=False, cwd=ROOT, stdout=log,
                                       stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                      timeout=20 * 60,
+                                      timeout=(28 if step[1] == "desk.cli" else 20) * 60,
                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
                                       ).returncode
             except subprocess.TimeoutExpired:
