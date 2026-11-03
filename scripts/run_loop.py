@@ -39,13 +39,17 @@ def main() -> int:
         log.flush()
         for step in STEPS:
             started = datetime.now()
+            p = subprocess.Popen([str(PY), *step], cwd=ROOT, stdout=log,
+                                 stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             try:
-                code = subprocess.run([str(PY), *step], check=False, cwd=ROOT, stdout=log,
-                                      stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                      timeout=(28 if step[1] == "desk.cli" else 20) * 60,
-                                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                                      ).returncode
+                code = p.wait(timeout=(28 if step[1] == "desk.cli" else 20) * 60)
             except subprocess.TimeoutExpired:
+                # The venv python.exe is a launcher with the real interpreter as its child;
+                # killing only the launcher once left an orphan holding up later runs.
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], check=False,
+                               capture_output=True)
+                p.wait()
                 code = 124                  # one stuck market must not block the rest
             took = (datetime.now() - started).total_seconds()
             log.write(f"--- {' '.join(step[1:])} exit {code} ({took:.0f}s)\n")
