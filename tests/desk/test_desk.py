@@ -527,3 +527,43 @@ def test_parse_queries_is_strict():
     from desk.gemini import parse_queries
     assert parse_queries('blah\nQUERIES: ["a", " b ", 3, ""]', 5) == ["a", "b"]
     assert parse_queries("QUERIES: [oops", 5) == [] and parse_queries("no plan", 5) == []
+
+
+def test_groq_backup_takes_over_when_every_gemini_model_is_out():
+    import httpx
+
+    from desk import gemini as g
+    from desk.groq import GroqRest
+    sent, waits = [], []
+
+    def groq(req):
+        body = json.loads(req.read())
+        sent.append(body)
+        if len(sent) == 1:                      # per-minute budget: short wait, then retry
+            return httpx.Response(429, json={"error": {"message": "Rate limit reached ... "
+                                                       "Please try again in 3.045s."}})
+        if body["model"] == "openai/gpt-oss-120b" and len(sent) == 3:
+            return httpx.Response(413, json={"error": {"message": "request too large"}})
+        return httpx.Response(200, json={"model": body["model"], "usage": {
+            "prompt_tokens": 50, "completion_tokens": 7},
+            "choices": [{"message": {"content": f"from {body['model']}"}}]})
+
+    class Quota(Exception):
+        status_code = 429
+
+    def gemini_out(**kw):
+        raise Quota("free quota used up")
+
+    g.EXHAUSTED.clear()
+    gem = NS(interactions=NS(create=gemini_out), searcher=None,
+             backup=GroqRest("gsk", transport=httpx.MockTransport(groq), sleep=waits.append))
+    cfg = DeskSettings(_env_file=None)
+    text, usage = g.ask(gem, cfg, "RISK", "sys", "chat", model=cfg.model, effort="high",
+                        search=False)
+    assert text == "from openai/gpt-oss-120b" and waits == [3.545]
+    assert sent[0]["messages"][0] == {"role": "system", "content": "sys"}
+    assert sent[0]["reasoning_effort"] == "high" and usage[0]["output_tokens"] == 7
+    text2, _ = g.ask(gem, cfg, "LEAD", "s", "c", model=cfg.model, effort="medium", search=False)
+    assert text2 == "from qwen/qwen3.8-27b"                 # 413 on gpt-oss: next model
+    assert "openai/gpt-oss-120b" in g.EXHAUSTED and "reasoning_effort" not in sent[-1]
+    g.EXHAUSTED.clear()

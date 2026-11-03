@@ -15,6 +15,13 @@ from pathlib import Path
 import httpx
 
 URL = "https://api.tavily.com/search"
+SNIPPET_CHARS = 1500
+
+
+def clean(text: str) -> str:
+    """Drop page furniture (menus, "Loading map...", link labels): short lines carry it,
+    while forecasts, scores and data releases are full sentences."""
+    return " | ".join(ln.strip() for ln in text.splitlines() if len(ln.strip()) >= 25)
 
 
 class SearchUnavailable(RuntimeError):
@@ -23,7 +30,7 @@ class SearchUnavailable(RuntimeError):
 
 class TavilySearch:
     def __init__(self, api_key: str, *, daily_cap: int, usage_path: str,
-                 max_results: int = 5, transport: httpx.BaseTransport | None = None,
+                 max_results: int = 3, transport: httpx.BaseTransport | None = None,
                  clock=lambda: datetime.now(UTC)):
         self._key, self.daily_cap, self.max_results = api_key, daily_cap, max_results
         self._usage, self._clock = Path(usage_path), clock
@@ -76,6 +83,6 @@ class TavilySearch:
             for h in hits:
                 k = sum(1 for x in lines if x.startswith("[S"))
                 lines.append(f"[S{k + 1}] {h['title']} ({h['date'] or 'date unknown'}) "
-                             f"{h['url']}\n    {h['content'][:700]}")
+                             f"{h['url']}\n    {clean(h['content'])[:SNIPPET_CHARS]}")
         note = f"(web search limited: {'; '.join(notes)})\n" if notes else ""
         return "\n".join(lines) or "No results.", n, note

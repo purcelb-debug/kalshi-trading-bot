@@ -26,6 +26,11 @@ class DeskSettings(BaseSettings):
     #: Tried in order when a Gemini model's free daily quota is used up (quotas are per model).
     gemini_models: list[str] = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite",
                                 "gemini-3.1-flash-lite"]
+    #: Free backup after every Gemini model is out for the day (Groq: ~1,000 requests a day,
+    #: 8,000 tokens a minute). Used only when GROQ_API_KEY is set.
+    groq_models: list[str] = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"]
+    groq_api_key: str = Field(default="", validation_alias=AliasChoices(
+        "GROQ_API_KEY", "groq_api_key"))
     search_provider: Literal["claude", "gemini"] = "gemini"
     search_model: str = "gemini-3.8-flash"     # News Checker
     skeptic_model: str = "gemini-3.8-flash"    # Skeptic, also on search_provider
@@ -55,7 +60,8 @@ class DeskSettings(BaseSettings):
     prices: dict[str, tuple[float, float]] = {
         "claude-opus-5-5": (4.0, 20.0), "claude-sonnet-5-5": (2.0, 10.0),
         "gemini-3.8-flash": (0.0, 0.0), "gemini-3.6-flash": (0.0, 0.0),   # free-tier key
-        "gemini-3.5-flash-lite": (0.0, 0.0), "gemini-3.1-flash-lite": (0.0, 0.0)}
+        "gemini-3.5-flash-lite": (0.0, 0.0), "gemini-3.1-flash-lite": (0.0, 0.0),
+        "openai/gpt-oss-120b": (0.0, 0.0), "qwen/qwen3.8-27b": (0.0, 0.0)}
     web_search_usd: float = 0.01
     #: Broad scan (desk@ALL): markets closing within ``scan_horizon_h`` hours.
     scan_horizon_h: float = Field(default=48.0, gt=0)

@@ -17,6 +17,9 @@ def make_client(cfg: DeskSettings, provider: str):
             client.searcher = TavilySearch(cfg.tavily_api_key,
                                            daily_cap=cfg.search_daily_cap,
                                            usage_path=cfg.search_usage_path)
+        if cfg.groq_api_key:            # free backup once Gemini's daily quotas run out
+            from desk.groq import GroqRest
+            client.backup = GroqRest(cfg.groq_api_key)
         return client
 
     import anthropic

@@ -146,3 +146,10 @@ held position, a statistical go-live gate). Only the parts that filled gaps were
   Live check: correct query, cited answer, 3.2s, $0. Limits: Gemini's free quota is about
   20 requests a day per model, so late in a busy day roles fall to flash-lite models.
 
+- **Groq backup and cleaner search (2026-11-03):** with `GROQ_API_KEY` set, the free chain
+  continues after the four Gemini models with Groq's `openai/gpt-oss-120b` and
+  `qwen/qwen3.8-27b` (free: ~1,000 requests/day, 8,000 tokens/minute; short "try again in Ns"
+  waits are honoured, too-large requests move on). Search results now drop page furniture
+  (lines under 25 chars) and keep 1,500 chars from each of 3 results. Before this the NWS
+  forecast numbers were cut off and the desk correctly said NO CLEAR INFORMATION; after it,
+  gpt-oss-120b found the official Central Park point forecast (HARD, cited) in 5.9s, $0.
