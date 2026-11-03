@@ -58,14 +58,24 @@ def cycle(deployment: str = typer.Option("desk@KXHIGHNY-h30"),
         # One failing market must not stop the others; the exit code still reports it.
         failed, held = [], 0
         for dep in desk_deployments(sim):
-            try:
-                out = run_desk_cycle(market, sim, cfg, LoopConfig(dep, report_dir=cfg.report_dir),
-                                     allow_meeting=held < cfg.max_meetings_per_cycle)
-                held += out["desk"]["status"] in ("meeting_held", "meeting_aborted")
-                typer.echo(json.dumps({"deployment": dep, "desk": out["desk"]}, default=str))
-            except Exception as e:  # noqa: BLE001 - reported, then the next market runs
-                failed.append(dep)
-                typer.echo(f"{dep} failed: {type(e).__name__}: {e}", err=True)
+            # The broad desk meets again on the next unseen markets while this run's
+            # meeting allowance lasts; a fixed-series desk has one decision point per run.
+            again = True
+            while again:
+                again = False
+                try:
+                    out = run_desk_cycle(market, sim, cfg,
+                                         LoopConfig(dep, report_dir=cfg.report_dir),
+                                         allow_meeting=held < cfg.max_meetings_per_cycle)
+                    met = out["desk"]["status"] in ("meeting_held", "meeting_aborted")
+                    held += met
+                    again = met and dep.startswith("desk@ALL") and \
+                        held < cfg.max_meetings_per_cycle
+                    typer.echo(json.dumps({"deployment": dep, "desk": out["desk"]},
+                                          default=str))
+                except Exception as e:  # noqa: BLE001 - reported, then the next market runs
+                    failed.append(dep)
+                    typer.echo(f"{dep} failed: {type(e).__name__}: {e}", err=True)
         raise typer.Exit(1 if failed else 0)
     loop = LoopConfig(deployment, report_dir=cfg.report_dir)
     if dry:   # works before registration: series and horizon come from the id

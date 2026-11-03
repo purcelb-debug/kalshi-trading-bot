@@ -43,7 +43,7 @@ def main() -> int:
                                  stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             try:
-                code = p.wait(timeout=(28 if step[1] == "desk.cli" else 20) * 60)
+                code = p.wait(timeout=(40 if step[1] == "desk.cli" else 20) * 60)
             except subprocess.TimeoutExpired:
                 # The venv python.exe is a launcher with the real interpreter as its child;
                 # killing only the launcher once left an orphan holding up later runs.

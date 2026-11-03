@@ -567,3 +567,24 @@ def test_groq_backup_takes_over_when_every_gemini_model_is_out():
     assert text2 == "from qwen/qwen3.8-27b"                 # 413 on gpt-oss: next model
     assert "openai/gpt-oss-120b" in g.EXHAUSTED and "reasoning_effort" not in sent[-1]
     g.EXHAUSTED.clear()
+
+
+def test_cycle_all_holds_back_to_back_broad_meetings_up_to_the_run_limit(monkeypatch):
+    from typer.testing import CliRunner
+
+    import desk.cycle as cyc
+    from desk import cli
+    calls = []
+
+    def fake_cycle(market, sim, cfg, loop, allow_meeting=True, **kw):
+        calls.append((loop.deployment, allow_meeting))
+        return {"desk": {"status": "meeting_held" if allow_meeting else "deferred"}}
+
+    monkeypatch.setattr(cli, "_engines", lambda: (None, None))
+    monkeypatch.setattr(cli, "DeskSettings", lambda: DeskSettings(_env_file=None,
+                                                                  max_meetings_per_cycle=3))
+    monkeypatch.setattr(cyc, "desk_deployments", lambda sim: ["desk@ALL-h48"])
+    monkeypatch.setattr(cyc, "run_desk_cycle", fake_cycle)
+    r = CliRunner().invoke(cli.app, ["cycle", "--all"])
+    assert r.exit_code == 0, r.output
+    assert calls == [("desk@ALL-h48", True)] * 3                # 3 meetings, then stops

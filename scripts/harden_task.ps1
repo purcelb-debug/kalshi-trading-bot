@@ -1,6 +1,6 @@
 # Scheduling hardening for the predlab paper loop. Run once, by hand, after reading it:
 #   powershell -ExecutionPolicy Bypass -File scripts\harden_task.ps1
-# 1. Lets the existing loop task wake the PC from sleep and run every 30 minutes
+# 1. Lets the existing loop task wake the PC from sleep and run every 15 minutes
 #    (it does not change sleep policy).
 # 2. Registers a Friday 17:00 task that sends the weekly scorecard to Telegram.
 # The weekly task only reads and sends. The hourly task also runs the executor in whatever
@@ -13,9 +13,9 @@ $Pyw = Join-Path $Root ".venv\Scripts\pythonw.exe"
 # 1. Wake to run the hourly loop.
 $task = Get-ScheduledTask -TaskName "predlab paper loop"
 $task.Settings.WakeToRun = $true
-$task.Triggers[0].Repetition.Interval = "PT30M"     # every 30 minutes (was hourly)
+$task.Triggers[0].Repetition.Interval = "PT15M"     # every 15 minutes (was hourly, then 30)
 Set-ScheduledTask -InputObject $task | Out-Null
-Write-Host "predlab paper loop: WakeToRun = true, every 30 minutes"
+Write-Host "predlab paper loop: WakeToRun = true, every 15 minutes"
 
 # 2. Weekly scorecard (Friday after the close).
 $action = New-ScheduledTaskAction -Execute $Pyw -Argument "-m notify.cli weekly" -WorkingDirectory $Root
