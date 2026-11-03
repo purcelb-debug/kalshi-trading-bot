@@ -88,6 +88,13 @@ def _audit_line(rec: dict, seen: dict) -> str | None:
             return None
         standing["gate"] = f"{ev}:{reason}"
         return f"{ev.replace('_', ' ')}: {reason}"
+    if ev == "profit_target_reached":
+        standing = seen.setdefault("standing", {})
+        if standing.get("target") == rec.get("day"):
+            return None                     # logged every cycle that day: say it once
+        standing["target"] = rec.get("day")
+        return (f"DAILY GOAL MET: up ${rec.get('up_usd')} today (target "
+                f"${rec.get('target_usd')}). No new buys until tomorrow; exits still run.")
     if ev == "cycle_refused":
         reason = str(rec.get("reason"))
         if seen.get("last_refusal") == reason:

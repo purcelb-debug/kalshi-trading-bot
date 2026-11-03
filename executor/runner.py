@@ -129,6 +129,14 @@ def run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, *,
             audit.write("cycle_end", results=len(results), halted=state.halted)
             return results
 
+    up = total_value - (state.day_start_value_usd or total_value)
+    if cfg.daily_profit_target_usd is not None and up >= cfg.daily_profit_target_usd:
+        # Goal met for the day: keep the gain, open nothing new until tomorrow.
+        audit.write("profit_target_reached", day=state.day, up_usd=round(up, 2),
+                    target_usd=cfg.daily_profit_target_usd)
+        state.save(state_path)
+        return results + [{"status": "target_reached", "up_usd": round(up, 2)}]
+
     fc = latest_forecasts(sim_engine, model_version, forecast_max_age_h)
     if fc.empty:
         audit.write("no_forecasts", model_version=model_version)

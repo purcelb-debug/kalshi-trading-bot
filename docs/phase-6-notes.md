@@ -129,4 +129,11 @@ held position, a statistical go-live gate). Only the parts that filled gaps were
   "this model is out of quota": next model in `DESK_GEMINI_MODELS` (3.8-flash, 3.6-flash,
   3.5-flash-lite, 3.1-flash-lite, each with its own free quota), then Claude. Every role
   also has a hard wall-clock limit (`DESK_ROLE_TIMEOUT_S`, 240s) enforced outside any SDK.
+- **$8/day push mode (owner-approved 2026-11-03, real money):** executor limits raised to
+  bankroll $40, max order $15 (min $3), Kelly 0.5, min edge 2c; daily loss stop unchanged at
+  $25. Desk: $2/day LLM budget, 5 picks and 5 BUYs per meeting. New
+  `EXECUTOR_DAILY_PROFIT_TARGET_USD=8`: once the account is up $8 since the day's first
+  cycle (US Eastern day; the daily loss stop uses the same day now), no new buys until
+  tomorrow; exits still run, and Telegram says "DAILY GOAL MET" once. These settings make
+  more and larger bets. They don't add edge, and they make losing days bigger.
 

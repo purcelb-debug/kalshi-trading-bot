@@ -369,3 +369,61 @@ def test_cycle_exits_before_buying_and_never_rebuys(tmp_path):
     events = [json_line["event"] for json_line in map(__import__("json").loads,
               (tmp_path / "audit_live.jsonl").read_text().splitlines())]
     assert "exit_submit" in events and "exit_ack" in events
+
+
+def test_daily_profit_target_stops_new_buys_but_not_exits(tmp_path):
+    import json as _json
+
+    import pandas as pd
+
+    from executor.client import OrderAck
+    from executor.config import GATE_OVERRIDE_PHRASE
+    from executor.runner import run_cycle
+    from predlab.backtest.execution import Quote
+    from predlab.db.repo import init_sim_db, make_engine
+    from predlab.forecasts import record_forecasts
+    from predlab.models.base import Forecast
+    from predlab.timeutil import utcnow
+    sim = make_engine(f"sqlite:///{tmp_path / 'sim.db'}")
+    init_sim_db(sim)
+    now = pd.Timestamp(utcnow())
+    exp = {"side": "yes", "take_profit": 0.60, "stop": 0.35}
+    record_forecasts(sim, [Forecast("HELD", "desk@ALL-h48", 0.70, None, None, now, now, (), exp),
+                           Forecast("NEW", "desk@ALL-h48", 0.80, None, None, now, now, (), {})])
+    calls = []
+
+    class Client:
+        value = 50.0
+
+        def balance_usd(self):
+            return self.value, 0.0
+
+        def positions(self):
+            return [{"ticker": "HELD", "side": "yes", "qty": 5, "exposure_usd": 2.0,
+                     "fees_usd": 0.1}]
+
+        def place_ioc_exit(self, *a):
+            calls.append(("exit", a[0]))
+            return OrderAck("x", "c", 0.0, 5.0, None, None)
+
+        def place_ioc_buy(self, *a):
+            calls.append(("buy", a[0]))
+            return OrderAck("o", "c", 1.0, 0.0, 0.4, 0.01)
+
+    book = Quote(now, "book", [(0.40, 500.0)], [(0.61, 500.0)], 0.65, 0.35)
+    cfg = ExecutorSettings(_env_file=None, mode="live", live_key_id="k", live_key_path="p",
+                           data_dir=str(tmp_path), kill_switch_path=str(tmp_path / "KILL"),
+                           bankroll_cap_usd=40, max_order_usd=15, daily_loss_stop_usd=25,
+                           daily_profit_target_usd=8, gate_override=GATE_OVERRIDE_PHRASE,
+                           attended=False)
+    c = Client()
+    run_cycle(cfg, sim, "desk@ALL-h48", client=c, quotes={"HELD": book, "NEW": book})
+    assert ("buy", "NEW") in calls                          # day starts at $50: still buying
+    calls.clear()
+    c.value = 58.5                                          # up $8.50 today
+    out = run_cycle(cfg, sim, "desk@ALL-h48", client=c, quotes={"HELD": book, "NEW": book})
+    assert calls == [("exit", "HELD")]                      # exits yes, buys no
+    assert out[-1] == {"status": "target_reached", "up_usd": 8.5}
+    events = [_json.loads(x)["event"] for x in (tmp_path / "audit_live.jsonl").read_text()
+              .splitlines()]
+    assert "profit_target_reached" in events

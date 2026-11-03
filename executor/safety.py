@@ -5,6 +5,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from executor.config import ExecutorSettings
 
@@ -36,7 +37,8 @@ class State:
         tmp.replace(path)
 
     def roll_day(self, total_value_usd: float) -> None:
-        today = _now().date().isoformat()
+        # Trading day in US Eastern time, matching the daily profit report.
+        today = _now().astimezone(ZoneInfo("America/New_York")).date().isoformat()
         if self.day != today:
             self.day, self.day_start_value_usd, self.orders_today = today, total_value_usd, 0
 
