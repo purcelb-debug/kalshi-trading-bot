@@ -17,22 +17,30 @@ class DeskSettings(BaseSettings):
                                       env_file_encoding="utf-8", extra="ignore",
                                       env_ignore_empty=True, populate_by_name=True)
 
-    #: Scanner, Pricer, Risk and Desk Lead run on ``provider`` (no web search needed, so a
-    #: free Gemini key is enough). News and Skeptic need web search and run on
-    #: ``search_provider``. Set the model names to match each provider.
+    #: Scanner, Pricer, Risk and Desk Lead run on ``provider``. News and Skeptic need web
+    #: search and run on ``search_provider``. Default: all free. Gemini answers, and with a
+    #: TAVILY_API_KEY the searches are run by code (desk.search, free tier). Set
+    #: ``search_provider=claude`` and Claude model names to use paid Claude search instead.
     provider: Literal["claude", "gemini"] = "gemini"
     model: str = "gemini-3.8-flash"
     #: Tried in order when a Gemini model's free daily quota is used up (quotas are per model).
     gemini_models: list[str] = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite",
                                 "gemini-3.1-flash-lite"]
-    search_provider: Literal["claude", "gemini"] = "claude"
-    search_model: str = "claude-sonnet-5-5"    # News Checker
-    skeptic_model: str = "claude-sonnet-5-5"   # Skeptic, also on search_provider
+    search_provider: Literal["claude", "gemini"] = "gemini"
+    search_model: str = "gemini-3.8-flash"     # News Checker
+    skeptic_model: str = "gemini-3.8-flash"    # Skeptic, also on search_provider
     effort: str = "medium"           # Claude effort / Gemini thinking_level
     skeptic_effort: str = "high"
     gemini_api_key: str = Field(default="", validation_alias=AliasChoices(
         "GEMINI_API_KEY", "gemini_api_key"))
     search_max_uses: int = Field(default=3, ge=1)        # Claude only
+    #: Free search (Tavily, 1,000 searches a month): the key, queries per searching role,
+    #: and a daily cap so the month's credits last (30 x 30 days = 900).
+    tavily_api_key: str = Field(default="", validation_alias=AliasChoices(
+        "TAVILY_API_KEY", "tavily_api_key"))
+    searches_per_role: int = Field(default=3, ge=1)
+    search_daily_cap: int = Field(default=30, ge=0)
+    search_usage_path: str = str(ROOT / "data" / "desk_search_usage.json")
     #: Time limits so one slow call can't eat the job's step: per LLM request, and per meeting
     #: (the meeting stops after the role that crosses it and is recorded as aborted).
     call_timeout_s: float = Field(default=180.0, gt=0)

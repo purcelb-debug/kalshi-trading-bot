@@ -136,4 +136,13 @@ held position, a statistical go-live gate). Only the parts that filled gaps were
   cycle (US Eastern day; the daily loss stop uses the same day now), no new buys until
   tomorrow; exits still run, and Telegram says "DAILY GOAL MET" once. These settings make
   more and larger bets. They don't add edge, and they make losing days bigger.
+- **Free desk (2026-11-03, owner: stop paying for Anthropic):** all six roles run on free
+  Gemini by default (`DESK_SEARCH_PROVIDER=gemini`). News Checker and Skeptic search the
+  web through code: the model writes up to `DESK_SEARCHES_PER_ROLE` (3) queries, `desk.search`
+  runs them on Tavily's free tier (1,000/month, `TAVILY_API_KEY`, capped at 30/day in
+  `data/desk_search_usage.json`), and the model answers from the numbered, untrusted
+  results, citing [S#] and URL. With no key or the cap reached, the roles answer without
+  search and say so. No Claude client is created unless `DESK_SEARCH_PROVIDER=claude`.
+  Live check: correct query, cited answer, 3.2s, $0. Limits: Gemini's free quota is about
+  20 requests a day per model, so late in a busy day roles fall to flash-lite models.
 

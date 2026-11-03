@@ -230,9 +230,11 @@ def test_gemini_desk_registers_under_its_own_name(sim_engine):
     assert dep == "desk@X-h30"
 
 
-def test_default_desk_sends_only_search_roles_to_claude():
+def test_mixed_desk_sends_only_search_roles_to_claude():
     claude, gem = FakeClient(lambda kw: "c"), FakeGemini(lambda kw: "g")
-    m = run_meeting({"claude": claude, "gemini": gem}, DeskSettings(_env_file=None), "table")
+    cfg = DeskSettings(_env_file=None, search_provider="claude", search_model="claude-sonnet-5-5",
+                       skeptic_model="claude-sonnet-5-5")
+    m = run_meeting({"claude": claude, "gemini": gem}, cfg, "table")
     assert [r for r, _ in m.transcript] == ["SCANNER", "NEWS", "PRICER", "RISK", "SKEPTIC",
                                             "DESK LEAD"]
     assert [msg for _, msg in m.transcript] == ["g", "c", "g", "g", "c", "g"]
@@ -457,3 +459,71 @@ def test_gemini_rest_client_parses_answers_and_fails_fast_on_quota():
     assert usage[0]["output_tokens"] == 97                       # thinking billed as output
     assert seen == [("k", "gemini-3.8-flash", False), ("k", "gemini-3.6-flash", False)]
     g.EXHAUSTED.clear()
+
+
+def test_free_desk_searches_by_code_and_never_calls_claude(tmp_path):
+    import httpx
+
+    from desk import gemini as g
+    from desk.search import TavilySearch
+    searched = []
+
+    def tavily(req):
+        body = json.loads(req.read())
+        searched.append((req.headers["authorization"], body["query"]))
+        return httpx.Response(200, json={"results": [
+            {"title": "NWS forecast", "url": "https://weather.gov/x", "content": "High 55F",
+             "published_date": "2026-11-03"}]})
+
+    def answer(kw):
+        if "SEARCH PLAN" in kw["system_instruction"]:
+            return 'QUERIES: ["NWS Central Park high Nov 3", "second", "third", "fourth"]'
+        if "WEB SEARCH RESULTS" in kw["input"]:
+            assert "[S1] NWS forecast (2026-11-03) https://weather.gov/x" in kw["input"]
+            return "High 55F per NWS [S1]"
+        return "NOTHING UNUSUAL" if "SCANNER" in kw["system_instruction"] else "ok"
+
+    g.EXHAUSTED.clear()
+    gem = FakeGemini(answer)
+    gem.searcher = TavilySearch("tvly-k", daily_cap=30, usage_path=str(tmp_path / "u.json"),
+                                transport=httpx.MockTransport(tavily))
+    cfg = DeskSettings(_env_file=None, searches_per_role=3)
+    assert cfg.provider == cfg.search_provider == "gemini"
+    text, usage = g.ask(gem, cfg, "NEWS", "You are the NEWS CHECKER.", "table",
+                        model=cfg.search_model, effort="medium", search=True)
+    assert text.startswith("(searched: NWS Central Park high Nov 3; second; third)")
+    assert text.endswith("High 55F per NWS [S1]") and len(searched) == 3
+    assert searched[0] == ("Bearer tvly-k", "NWS Central Park high Nov 3")
+    assert usage[1]["web_searches"] == 3 and usage[1]["search_backend"] == "tavily"
+    from desk.cycle import meeting_cost
+    assert meeting_cost(usage, cfg) == 0.0                         # free end to end
+    m = run_meeting({"gemini": gem}, cfg, "table")                  # no Claude client at all
+    assert m.transcript[0] == ("SCANNER", "NOTHING UNUSUAL")
+
+
+def test_search_cap_and_quota_errors_degrade_to_no_search(tmp_path):
+    import httpx
+
+    from desk.search import TavilySearch
+    calls = []
+
+    def tavily(req):
+        calls.append(1)
+        return (httpx.Response(432, json={"detail": {"error": "plan limit"}}) if len(calls) > 2
+                else httpx.Response(200, json={"results": []}))
+
+    s = TavilySearch("k", daily_cap=5, usage_path=str(tmp_path / "u.json"),
+                     transport=httpx.MockTransport(tavily))
+    _, n, note = s.run(["a", "b", "c", "d"])
+    assert n == 2 and "Tavily HTTP 432" in note and s.used_today() == 2
+    capped = TavilySearch("k", daily_cap=2, usage_path=str(tmp_path / "u.json"),
+                          transport=httpx.MockTransport(tavily))
+    _, n2, note2 = capped.run(["x"])
+    assert n2 == 0 and "daily search cap 2 reached" in note2 and len(calls) == 3
+    assert TavilySearch("", daily_cap=5, usage_path=str(tmp_path / "v.json")).run(["q"])[1] == 0
+
+
+def test_parse_queries_is_strict():
+    from desk.gemini import parse_queries
+    assert parse_queries('blah\nQUERIES: ["a", " b ", 3, ""]', 5) == ["a", "b"]
+    assert parse_queries("QUERIES: [oops", 5) == [] and parse_queries("no plan", 5) == []

@@ -92,7 +92,8 @@ def meeting_cost(usage: list[dict], cfg: DeskSettings) -> float:
     for u in usage or []:
         p_in, p_out = cfg.prices.get(u.get("model"), cfg.prices["claude-opus-5-5"])
         total += (u.get("input_tokens", 0) * p_in + u.get("output_tokens", 0) * p_out) / 1e6
-        total += u.get("web_searches", 0) * cfg.web_search_usd
+        if u.get("search_backend") != "tavily":     # Tavily's free tier costs nothing
+            total += u.get("web_searches", 0) * cfg.web_search_usd
     return total
 
 

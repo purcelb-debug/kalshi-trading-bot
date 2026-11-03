@@ -10,8 +10,14 @@ from desk.config import DeskSettings
 def make_client(cfg: DeskSettings, provider: str):
     if provider == "gemini":
         from desk.gemini import GeminiRest
+        from desk.search import TavilySearch
 
-        return GeminiRest(cfg.gemini_api_key)
+        client = GeminiRest(cfg.gemini_api_key)
+        if cfg.tavily_api_key:          # free search run by code for News and Skeptic
+            client.searcher = TavilySearch(cfg.tavily_api_key,
+                                           daily_cap=cfg.search_daily_cap,
+                                           usage_path=cfg.search_usage_path)
+        return client
 
     import anthropic
 
