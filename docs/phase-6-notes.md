@@ -121,4 +121,12 @@ held position, a statistical go-live gate). Only the parts that filled gaps were
   the next. Telegram sends a daily MET/MISSED line with the 7-day average. Deposits and
   withdrawals move the number too (the Nov 1 deposit shows as +$25.59). The target is a
   measurement only and never changes sizing or limits.
+- **Why meetings kept timing out (found 2026-11-03):** gemini-3.8-flash's free tier allows
+  20 requests a day. Once used up, Google returns 429 with Retry-After of ~12 hours, and the
+  google-genai SDK slept for it inside the call (it honours Retry-After uncapped and its
+  interactions client ignores the client retry setting). The desk now calls the Gemini REST
+  API directly with httpx (`desk.gemini.GeminiRest`, no hidden retries), treats 429 as
+  "this model is out of quota": next model in `DESK_GEMINI_MODELS` (3.8-flash, 3.6-flash,
+  3.5-flash-lite, 3.1-flash-lite, each with its own free quota), then Claude. Every role
+  also has a hard wall-clock limit (`DESK_ROLE_TIMEOUT_S`, 240s) enforced outside any SDK.
 

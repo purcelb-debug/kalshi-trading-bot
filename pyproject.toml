@@ -22,7 +22,7 @@ dependencies = [
 models = ["scikit-learn>=1.4", "lightgbm>=4", "scipy>=1.11", "statsmodels>=0.14"]
 dashboard = ["streamlit>=1.35", "plotly>=5.20"]
 reports = ["jinja2>=3.1"]
-llm = ["anthropic>=1.0", "google-genai>=2.34"]
+llm = ["anthropic>=1.0"]
 postgres = ["psycopg[binary]>=3.1"]
 executor = ["cryptography>=42"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "respx>=0.21", "hypothesis>=6", "ruff>=0.5"]

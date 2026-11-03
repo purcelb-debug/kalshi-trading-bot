@@ -9,9 +9,9 @@ from desk.config import DeskSettings
 
 def make_client(cfg: DeskSettings, provider: str):
     if provider == "gemini":
-        from google import genai
+        from desk.gemini import GeminiRest
 
-        return genai.Client(api_key=cfg.gemini_api_key) if cfg.gemini_api_key else genai.Client()
+        return GeminiRest(cfg.gemini_api_key)
 
     import anthropic
 

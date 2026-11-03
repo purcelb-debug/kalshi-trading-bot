@@ -22,6 +22,9 @@ class DeskSettings(BaseSettings):
     #: ``search_provider``. Set the model names to match each provider.
     provider: Literal["claude", "gemini"] = "gemini"
     model: str = "gemini-3.8-flash"
+    #: Tried in order when a Gemini model's free daily quota is used up (quotas are per model).
+    gemini_models: list[str] = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite",
+                                "gemini-3.1-flash-lite"]
     search_provider: Literal["claude", "gemini"] = "claude"
     search_model: str = "claude-sonnet-5-5"    # News Checker
     skeptic_model: str = "claude-sonnet-5-5"   # Skeptic, also on search_provider
@@ -34,6 +37,7 @@ class DeskSettings(BaseSettings):
     #: (the meeting stops after the role that crosses it and is recorded as aborted).
     call_timeout_s: float = Field(default=180.0, gt=0)
     meeting_deadline_s: float = Field(default=600.0, gt=0)
+    role_timeout_s: float = Field(default=240.0, gt=0)   # hard limit per role, all retries
     max_meetings_per_cycle: int = Field(default=2, ge=1)
     #: Hard caps per UTC day across ALL desk deployments combined: meetings, and estimated
     #: LLM spend in dollars (measured token use x ``prices``, plus web searches).
@@ -42,7 +46,8 @@ class DeskSettings(BaseSettings):
     #: $ per million tokens (input, output). Unknown models are priced as Opus to be safe.
     prices: dict[str, tuple[float, float]] = {
         "claude-opus-5-5": (4.0, 20.0), "claude-sonnet-5-5": (2.0, 10.0),
-        "gemini-3.8-flash": (0.0, 0.0)}      # free-tier key
+        "gemini-3.8-flash": (0.0, 0.0), "gemini-3.6-flash": (0.0, 0.0),   # free-tier key
+        "gemini-3.5-flash-lite": (0.0, 0.0), "gemini-3.1-flash-lite": (0.0, 0.0)}
     web_search_usd: float = 0.01
     #: Broad scan (desk@ALL): markets closing within ``scan_horizon_h`` hours.
     scan_horizon_h: float = Field(default=48.0, gt=0)

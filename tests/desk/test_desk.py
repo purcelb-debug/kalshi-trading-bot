@@ -337,7 +337,8 @@ def test_parse_trades_keeps_sane_exit_levels_only():
 
 
 def test_meeting_stops_at_deadline_and_never_parses_a_partial_transcript():
-    ticks = iter([0, 0, 100, 700, 700, 700, 700])          # passes 600s before PRICER
+    # start, then per role: deadline check + time-limit read. Passes 600s before PRICER.
+    ticks = iter([0, 0, 0, 100, 100, 700, 700, 700, 700])
     c = FakeClient(lambda kw: "TRADES:\n" + json.dumps([{"ticker": "A-1", "action": "BUY",
                                                           "p_yes": 0.9}]))
     m = run_meeting({"claude": c}, _claude(), "table", clock=lambda: next(ticks))
@@ -381,3 +382,78 @@ def test_aborted_meeting_is_recorded_with_its_cost_and_markets(sim_engine, tmp_p
     from desk.scan import filter_rank
     rest = filter_rank(pd.DataFrame(_scan_rows()), cfg, exclude=_shown(sim_engine, dep), now=now)
     assert rest["ticker"].tolist() == ["BIG-2", "BIG-3"]          # aborted markets count as seen
+
+
+def test_hung_provider_is_cut_off_and_the_role_moves_to_the_other():
+    import time as _t
+
+    from desk.meeting import bounded
+    with pytest.raises(TimeoutError):
+        bounded(lambda: _t.sleep(5), 1.0)
+    hang = FakeGemini(lambda kw: "g")
+    hang.interactions = NS(create=lambda **kw: _t.sleep(30))      # SDK stuck retrying
+    claude = FakeClient(lambda kw: "NOTHING UNUSUAL")
+    cfg = DeskSettings(_env_file=None, role_timeout_s=1.0)
+    started = _t.monotonic()
+    m = run_meeting({"claude": claude, "gemini": hang}, cfg, "table")
+    assert _t.monotonic() - started < 10
+    assert m.transcript[0][1].startswith("(gemini unavailable: TimeoutError")
+
+
+def test_gemini_quota_moves_to_the_next_model_then_to_claude():
+    from desk import gemini as g
+
+    class Quota(Exception):
+        status_code = 429
+
+    g.EXHAUSTED.clear()
+    out_of_quota = {"gemini-3.8-flash"}
+
+    def create(**kw):
+        if kw["model"] in out_of_quota:
+            raise Quota("limit: 20 requests per day")
+        return NS(status="completed", model=kw["model"], output_text=f"from {kw['model']}",
+                  usage=NS(total_input_tokens=1, total_output_tokens=1, total_thought_tokens=0,
+                           total_cached_tokens=0, grounding_tool_count=None))
+
+    gem = NS(interactions=NS(create=create))
+    cfg = DeskSettings(_env_file=None)
+    text, usage = g.ask(gem, cfg, "SCANNER", "s", "c", model=cfg.model, effort="low",
+                        search=False)
+    assert text == "from gemini-3.6-flash" and usage[0]["model"] == "gemini-3.6-flash"
+    assert g.EXHAUSTED == {"gemini-3.8-flash"}                     # not retried this run
+    out_of_quota.update(cfg.gemini_models)
+    claude = FakeClient(lambda kw: "NOTHING UNUSUAL")
+    m = run_meeting({"claude": claude, "gemini": gem}, cfg, "table")
+    assert m.transcript[0][1].startswith("(gemini unavailable: QuotaExhausted")
+    g.EXHAUSTED.clear()
+
+
+def test_gemini_rest_client_parses_answers_and_fails_fast_on_quota():
+    import httpx
+
+    from desk import gemini as g
+    seen = []
+
+    def handler(req):
+        body = json.loads(req.read())
+        seen.append((req.headers["x-goog-api-key"], body["model"], "timeout" in body))
+        if body["model"] == "gemini-3.8-flash":
+            return httpx.Response(429, headers={"retry-after": "45536"},
+                                  json={"error": {"message": "limit: 20 requests per day"}})
+        return httpx.Response(200, json={
+            "status": "completed", "model": body["model"],
+            "usage": {"total_input_tokens": 9, "total_output_tokens": 1,
+                      "total_thought_tokens": 96, "total_cached_tokens": 0},
+            "steps": [{"type": "thought", "signature": "x"},
+                      {"type": "model_output", "content": [{"type": "text", "text": "Ok"}]}]})
+
+    g.EXHAUSTED.clear()
+    client = g.GeminiRest("k", transport=httpx.MockTransport(handler))
+    cfg = DeskSettings(_env_file=None)
+    text, usage = g.ask(client, cfg, "SCANNER", "s", "c", model=cfg.model, effort="low",
+                        search=False)
+    assert text == "Ok" and usage[0]["model"] == "gemini-3.6-flash"
+    assert usage[0]["output_tokens"] == 97                       # thinking billed as output
+    assert seen == [("k", "gemini-3.8-flash", False), ("k", "gemini-3.6-flash", False)]
+    g.EXHAUSTED.clear()

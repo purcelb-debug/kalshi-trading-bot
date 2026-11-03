@@ -9,6 +9,7 @@ anything; the transcript is just text for ``desk.validate`` to parse.
 """
 
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -89,6 +90,27 @@ def providers(cfg: DeskSettings) -> set[str]:
     return {cfg.provider, cfg.search_provider}
 
 
+def bounded(fn, seconds: float):
+    """Run ``fn()`` with a hard wall-clock limit. The call runs in a daemon thread that is
+    abandoned (not killed) on timeout, so no SDK retry loop can hold the meeting."""
+    box: dict = {}
+
+    def run():
+        try:
+            box["v"] = fn()
+        except BaseException as e:  # noqa: BLE001 - re-raised in the caller below
+            box["e"] = e
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    th.join(max(seconds, 1.0))
+    if th.is_alive():
+        raise TimeoutError(f"no answer within {seconds:.0f}s")
+    if "e" in box:
+        raise box["e"]
+    return box["v"]
+
+
 def run_meeting(clients: dict, cfg: DeskSettings, opening: str,
                 prompts: dict | None = None, clock=None) -> Meeting:
     """Run the six roles over ``opening`` (the code-built market table). ``clients`` maps
@@ -106,17 +128,21 @@ def run_meeting(clients: dict, cfg: DeskSettings, opening: str,
         prov = cfg.search_provider if search else cfg.provider
         model = cfg.skeptic_model if skeptic else cfg.search_model if search else cfg.model
         effort = cfg.skeptic_effort if skeptic else cfg.effort
+
+        def call(p, mdl, _name=name, _key=key, _chat=chat, _effort=effort, _search=search):
+            limit = min(cfg.role_timeout_s, cfg.meeting_deadline_s - (clock() - started))
+            return bounded(lambda: backends[p](clients[p], cfg, _name, prompts[_key], _chat,
+                                               model=mdl, effort=_effort, search=_search), limit)
+
         try:
-            msg, usage = backends[prov](clients[prov], cfg, name, prompts[key], chat,
-                                        model=model, effort=effort, search=search)
+            msg, usage = call(prov, model)
         except Exception as e:  # noqa: BLE001 - one provider down: the other answers
             other = "claude" if prov == "gemini" else "gemini"
             alt = cfg.search_model if other == cfg.search_provider else cfg.model
             try:
                 if other not in clients:
                     raise
-                msg, usage = backends[other](clients[other], cfg, name, prompts[key], chat,
-                                             model=alt, effort=effort, search=search)
+                msg, usage = call(other, alt)
             except Exception as e2:  # noqa: BLE001 - both down: stop, keep what was spent
                 m.aborted = f"{name} failed: {type(e).__name__}; fallback {type(e2).__name__}"
                 break
