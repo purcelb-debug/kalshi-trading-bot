@@ -63,68 +63,76 @@ def test_send_posts_each_chunk_and_hides_token_on_error(tmp_path):
     assert not ok and "SECRET" not in err
 
 
-def test_alerts_once_per_day_and_gate_change(tmp_path):
-    cfg, state = _cfg(tmp_path), {}
-    _report(tmp_path, NOW, gate={**GOOD_GATE, "paper_settled_trades": 10})
-    assert build_messages(cfg, state, NOW, _exec()) == []           # first look: baseline
-    alert = [{"rule": "worse_than_market", "detail": "d"}]
-    _report(tmp_path, NOW + timedelta(hours=1), alerts=alert, gate=GOOD_GATE)
-    msgs = build_messages(cfg, state, NOW + timedelta(hours=1), _exec())
-    assert any("[ALERT]" in m for m in msgs) and any("gate is now OPEN" in m for m in msgs)
-    _report(tmp_path, NOW + timedelta(hours=2), alerts=alert, gate=GOOD_GATE)
-    assert build_messages(cfg, state, NOW + timedelta(hours=2), _exec()) == []
+def _balance(tmp_path, cash, positions, ts=NOW):
+    from executor.ledger import _upsert, balances, ledger_engine
+    eng = ledger_engine(str(tmp_path / "exec"))
+    _upsert(eng, balances, [{"ts": ts, "cash": cash, "positions_value": positions}])
+    eng.dispose()
 
 
-def test_stale_loop_warns_once_then_resumes(tmp_path):
-    cfg, state = _cfg(tmp_path), {}
-    _report(tmp_path, NOW)
-    later = NOW + timedelta(hours=3)
-    assert "no completed cycle" in build_messages(cfg, state, later, _exec())[0]
-    assert build_messages(cfg, state, later, _exec()) == []
-    _report(tmp_path, later)
-    assert "resumed" in build_messages(cfg, state, later, _exec())[0]
-
-
-def test_executor_events_sent_once_and_refusals_deduplicated(tmp_path):
-    cfg, state = _cfg(tmp_path), {}
-    log = AuditLog(tmp_path / "exec" / "audit_demo.jsonl")
-    log.write("cycle_end", results=0, halted="old history")
-    assert build_messages(cfg, state, NOW, _exec()) == []      # history is not replayed
-    log.write("cycle_refused", reason="kill switch present")
-    log.write("cycle_refused", reason="kill switch present")
-    log.write("order_ack", order_id="o1", client_order_id="c", fill_count=3.0,
-              remaining_count=0.0, average_fill_price=0.42)
-    log.write("dry_run_order", plan={})
-    msgs = build_messages(cfg, state, NOW, _exec())
-    assert len(msgs) == 1 and msgs[0].count("kill switch") == 1
-    assert "filled 3" in msgs[0] and "1 dry-run" in msgs[0]
-    assert build_messages(cfg, state, NOW, _exec()) == []
-    log.write("cycle_end", results=0, halted="daily loss stop hit")
-    assert "HALTED" in build_messages(cfg, state, NOW, _exec())[0]
-
-
-def test_desk_transcripts_sent_in_order_once(tmp_path):
-    cfg, state = _cfg(tmp_path), {}
-    d = tmp_path / "reports" / "desk-meetings"
-    d.mkdir(parents=True)
-    (d / "20261102T1400.txt").write_text("first")
-    (d / "20261102T1500.txt").write_text("second")
-    assert build_messages(cfg, state, NOW, _exec()) == ["first", "second"]
-    assert build_messages(cfg, state, NOW, _exec()) == []
-
-
-def test_standing_gate_override_reported_once_across_cycles(tmp_path):
+def test_research_noise_sends_nothing(tmp_path):
     cfg, state = _cfg(tmp_path), {}
     log = AuditLog(tmp_path / "exec" / "audit_live.jsonl")
-    log.write("cycle_end", results=0, halted="")
-    build_messages(cfg, state, NOW, _exec())
+    log.write("cycle_start", mode="live")
+    assert build_messages(cfg, state, NOW, _exec()) == []           # first look: baseline
+    _report(tmp_path, NOW, alerts=[{"rule": "worse_than_market", "detail": "d"}],
+            gate=GOOD_GATE)
     for _ in range(3):
         log.write("cycle_start", mode="live")
         log.write("gate_overridden", reasons=["registry status is 'candidate'"])
-    msgs = build_messages(cfg, state, NOW, _exec())
-    assert len(msgs) == 1 and msgs[0].count("gate overridden") == 1
-    log.write("cycle_start", mode="live")
-    log.write("gate_overridden", reasons=["registry status is 'candidate'"])
+        log.write("no_forecasts", model_version="m")
+    assert build_messages(cfg, state, NOW, _exec()) == []           # nothing happened
+
+
+def test_stale_job_warns_once_then_says_running_again(tmp_path):
+    cfg, state = _cfg(tmp_path), {}
+    _report(tmp_path, NOW)
+    later = NOW + timedelta(hours=3)
+    msg = build_messages(cfg, state, later, _exec())
+    assert len(msg) == 1 and "hasn't finished a run" in msg[0]
+    assert build_messages(cfg, state, later, _exec()) == []
+    _report(tmp_path, later)
+    assert "Bot is running again" in build_messages(cfg, state, later, _exec())[0]
+
+
+def test_one_short_summary_with_account_and_the_bots_own_trades(tmp_path):
+    cfg, state = _cfg(tmp_path), {}
+    _balance(tmp_path, 47.63, 3.96)
+    log = AuditLog(tmp_path / "exec" / "audit_live.jsonl")
+    log.write("cycle_end", results=0, halted="old history")
+    assert build_messages(cfg, state, NOW, _exec()) == []           # history is not replayed
+    log.write("order_submit", mode="live", plan={"ticker": "T-1", "outcome": "no",
+                                                 "best_ask": 0.74, "max_price": 0.76})
+    log.write("order_ack", order_id="o1", fill_count=4.0, average_fill_price=0.26)
+    log.write("exit_submit", mode="live", plan={"ticker": "T-2", "held": "yes",
+                                                "reason": "take_profit", "min_price": 0.7})
+    log.write("exit_ack", order_id="x1", fill_count=5.0, average_fill_price=0.71)
+    for _ in range(2):
+        log.write("order_blocked", ticker="T-3", reason="bankroll cap $40.00 would be exceeded")
+        log.write("cycle_refused", reason="kill switch present")
+    (msg,) = build_messages(cfg, state, NOW, _exec())
+    head, body = msg.split("\n\n")
+    assert head.startswith("Kalshi bot · ") and "Account $51.59 = cash $47.63 + positions $3.96" in head
+    assert body.splitlines() == ["• Bought 4 NO T-1 at 74¢ ($2.96)",
+                                 "• Sold (take_profit) 5 YES T-2 at 71¢ ($3.55)",
+                                 "• 2 buys skipped: bankroll cap",
+                                 "• Trading paused: kill switch present"] or         body.splitlines() == ["• Bought 4 NO T-1 at 74¢ ($2.96)",
+                              "• Sold (take_profit) 5 YES T-2 at 71¢ ($3.55)",
+                              "• Trading paused: kill switch present",
+                              "• 2 buys skipped: bankroll cap"]
+    assert build_messages(cfg, state, NOW, _exec()) == []
+    log.write("cycle_end", results=0, halted="daily loss stop hit")
+    assert "Trading HALTED: daily loss stop hit" in build_messages(cfg, state, NOW, _exec())[0]
+
+
+def test_desk_meetings_counted_not_quoted(tmp_path):
+    cfg, state = _cfg(tmp_path), {}
+    d = tmp_path / "reports" / "desk-meetings"
+    d.mkdir(parents=True)
+    (d / "20261102T1400.txt").write_text("long transcript\nrecorded BUY A-1 p_yes=0.7")
+    (d / "20261102T1500.txt").write_text("another long transcript\nno trades")
+    (msg,) = build_messages(cfg, state, NOW, _exec())
+    assert msg.endswith("• Desk: 2 meetings, 1 buy") and "transcript" not in msg
     assert build_messages(cfg, state, NOW, _exec()) == []
 
 
@@ -146,7 +154,7 @@ def test_digest_survives_a_non_utf8_console(tmp_path):
     r = subprocess.run([sys.executable, "-m", "notify.cli", "digest", "--dry"], cwd=root,
                        env=env, capture_output=True, timeout=120, check=False)
     assert r.returncode == 0, r.stderr.decode("utf-8", "replace")[-500:]
-    assert "≤".encode() in r.stdout
+    assert "• Desk: 1 meeting".encode() in r.stdout and "·".encode() in r.stdout
 
 
 def test_daily_target_reported_once_per_finished_day(tmp_path):
@@ -161,9 +169,9 @@ def test_daily_target_reported_once_per_finished_day(tmp_path):
                          executor_data_dir=str(tmp_path), daily_target_usd=8.0)
     state = {}
     now = datetime(2026, 11, 4, 16, 0, tzinfo=UTC)
-    msgs = [m for m in build_messages(cfg, state, now=now, exec_cfg=ExecutorSettings(
-        _env_file=None)) if m.startswith("[DAILY TARGET]")]
-    assert msgs == [("[DAILY TARGET] 2026-11-03: MET - made $+9.50 vs $8.00 target "
-                    "(account $51.50).\nLast 1 day(s): avg $+9.50/day, target met 1 of 1.")]
+    (msg,) = build_messages(cfg, state, now=now, exec_cfg=ExecutorSettings(_env_file=None))
+    assert "Account $51.00 = cash $51.00 + positions $0.00" in msg
+    assert msg.endswith("• Yesterday: +$9.50, goal met ($8.00). Last 1 days: avg +$9.50/day, "
+                        "goal met 1 of 1")
     again = build_messages(cfg, state, now=now, exec_cfg=ExecutorSettings(_env_file=None))
-    assert not any(m.startswith("[DAILY TARGET]") for m in again)      # once per day
+    assert again == []                                                  # once per day
