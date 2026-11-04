@@ -39,7 +39,7 @@ class ExecutorSettings(BaseSettings):
     daily_loss_stop_usd: float | None = Field(default=None, gt=0)
     max_market_usd: float | None = Field(default=None, gt=0)
     #: Orders that pass the edge test are raised to at least this size (None = Kelly only).
-    min_order_usd: float | None = Field(default=None, gt=0)
+    min_order_usd: float | None = Field(default=3.0, gt=0)
     #: Owner's daily goal: once the account is up this much since the day's first cycle
     #: (US Eastern day), no new buys until tomorrow. Exits still run. None = no lock.
     daily_profit_target_usd: float | None = Field(default=None, gt=0)

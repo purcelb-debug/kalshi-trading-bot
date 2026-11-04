@@ -12,9 +12,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 LIVE = [                     # paper loop AND the executor (real money in live mode)
     "logistic_l2-57cdc200f7@KXHIGHNY-h30",
+    "market_implied+platt-5e74e39fb3@KXHIGHCHI-h30",
+
 ]
 PAPER_ONLY = [               # paper loop only: no model here has beaten the market yet
-    "market_implied+platt-5e74e39fb3@KXHIGHCHI-h30",
+
     "market_implied+platt-5e74e39fb3@KXHIGHMIA-h30",
 ]
 DESK_LIVE = [                # LLM desk deployments the executor trades (exits + buys)

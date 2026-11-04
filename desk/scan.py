@@ -8,6 +8,7 @@ min_volume, at least ``scan_min_hours`` to close. Ranking: 24h volume, at most
 """
 
 import asyncio
+import re
 import time
 
 import pandas as pd
@@ -46,6 +47,9 @@ def filter_rank(raw: pd.DataFrame, cfg: DeskSettings, *, exclude: set[str], now)
           & t["volume"].fillna(0).ge(cfg.scan_min_volume)
           & ~t["ticker"].isin(exclude)]
     t["event_ticker"] = t["event_ticker"].fillna(t["ticker"])
+    if getattr(cfg, "scan_exclude_prefixes", None):
+        pat = "^(?:" + "|".join(re.escape(p) for p in cfg.scan_exclude_prefixes) + ")"
+        t = t[~t["ticker"].str.contains(pat, case=False, regex=True)]
     t["hours_to_close"] = (pd.to_datetime(t["close_time"], utc=True) - pd.Timestamp(now)
                            ).dt.total_seconds() / 3600
     t = t[t["hours_to_close"].ge(cfg.scan_min_hours)]

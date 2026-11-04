@@ -72,6 +72,11 @@ class DeskSettings(BaseSettings):
     scan_min_volume: float = 100.0
     scan_per_event: int = Field(default=2, ge=1)
     scan_max_rows: int = Field(default=20, ge=1)
+    #: Prefixes excluded from broad scan (sports/esports where LLM lacks edge and triggers clustering).
+    scan_exclude_prefixes: list[str] = [
+        "KXLOL", "KXCS2", "KXDOTA", "KXBRASIL", "KXAPFD", "KXUCL", "KXNCAAMB",
+        "KXNCAAWB", "KXNBB", "KXDIMAYOR", "KXECULP", "KXNHL", "KXNBA", "KXNFL", "KXMLB"
+    ]
     #: Exit levels from the desk are clipped to these price bounds (price of the side held).
     exit_min_gap: float = Field(default=0.03, gt=0)
     max_picks: int = Field(default=3, ge=1)               # markets the Scanner may pick

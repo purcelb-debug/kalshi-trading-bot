@@ -35,6 +35,7 @@ class TavilySearch:
         self._key, self.daily_cap, self.max_results = api_key, daily_cap, max_results
         self._usage, self._clock = Path(usage_path), clock
         self._http = httpx.Client(transport=transport, timeout=30)
+        self._cache: dict[str, list[dict]] = {}
 
     def _today(self) -> str:
         return self._clock().date().isoformat()
@@ -53,6 +54,9 @@ class TavilySearch:
         self._usage.write_text(json.dumps(d), encoding="utf-8")
 
     def search(self, query: str) -> list[dict]:
+        norm_q = query.strip().lower()
+        if norm_q in self._cache:
+            return self._cache[norm_q]
         if not self._key:
             raise SearchUnavailable("TAVILY_API_KEY is not set")
         if self.used_today() >= self.daily_cap:
@@ -65,9 +69,11 @@ class TavilySearch:
             # 432/433: free plan used up; 429: too fast; 401: bad key. None are retried.
             raise SearchUnavailable(f"Tavily HTTP {r.status_code}: {r.text[:160]}")
         self._count()
-        return [{"title": x.get("title") or "", "url": x.get("url") or "",
+        hits = [{"title": x.get("title") or "", "url": x.get("url") or "",
                  "date": x.get("published_date") or "", "content": (x.get("content") or "")}
                 for x in r.json().get("results") or []]
+        self._cache[norm_q] = hits
+        return hits
 
     def run(self, queries: list[str]) -> tuple[str, int, str]:
         """(numbered source list, searches made, note for the transcript)."""
