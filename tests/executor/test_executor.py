@@ -427,3 +427,48 @@ def test_daily_profit_target_stops_new_buys_but_not_exits(tmp_path):
     events = [_json.loads(x)["event"] for x in (tmp_path / "audit_live.jsonl").read_text()
               .splitlines()]
     assert "profit_target_reached" in events
+
+
+def test_insufficient_balance_skips_buys_without_halting(tmp_path):
+    import pandas as pd
+
+    from executor.client import TradingError
+    from executor.config import GATE_OVERRIDE_PHRASE
+    from executor.runner import run_cycle
+    from executor.safety import State
+    from predlab.backtest.execution import Quote
+    from predlab.db.repo import init_sim_db, make_engine
+    from predlab.forecasts import record_forecasts
+    from predlab.models.base import Forecast
+    from predlab.timeutil import utcnow
+    sim = make_engine(f"sqlite:///{tmp_path / 'sim.db'}")
+    init_sim_db(sim)
+    now = pd.Timestamp(utcnow())
+    record_forecasts(sim, [Forecast(t, "desk@ALL-h48", 0.80, None, None, now, now, (), {})
+                           for t in ("A", "B", "C")])
+    buys = []
+
+    class Client:
+        def balance_usd(self):
+            return 30.0, 0.0
+
+        def positions(self):
+            return []
+
+        def place_ioc_buy(self, *a):
+            buys.append(a[0])
+            raise TradingError(400, '{"error":{"code":"insufficient_balance"}}')
+
+    book = Quote(now, "book", [(0.40, 500.0)], [(0.41, 500.0)], 0.65, 0.35)
+    cfg = ExecutorSettings(_env_file=None, mode="live", live_key_id="k", live_key_path="p",
+                           data_dir=str(tmp_path), kill_switch_path=str(tmp_path / "KILL"),
+                           bankroll_cap_usd=40, max_order_usd=15, daily_loss_stop_usd=25,
+                           gate_override=GATE_OVERRIDE_PHRASE, attended=False)
+    for _ in range(3):
+        out = run_cycle(cfg, sim, "desk@ALL-h48", client=Client(),
+                        quotes={t: book for t in "ABC"})
+        assert out[-1] == {"ticker": buys[-1], "status": "blocked",
+                           "reason": "insufficient balance on Kalshi"}
+    assert len(buys) == 3                              # one attempt per cycle, then stop
+    st = State.load(tmp_path / "state_live.json")
+    assert st.consecutive_errors == 0 and not st.halted

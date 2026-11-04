@@ -195,6 +195,15 @@ def run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, *,
         try:
             ack = client.place_ioc_buy(r.ticker, plan.outcome, plan.count, plan.max_price)
         except (TradingError, OSError) as e:
+            if isinstance(e, TradingError) and "insufficient_balance" in str(e):
+                # Kalshi rejected it outright (nothing reached the book): the cash is in
+                # open positions. Skip buying for the rest of this cycle, but don't count
+                # it toward the error halt, or exits would stop too.
+                audit.write("order_blocked", ticker=r.ticker,
+                            reason="insufficient balance on Kalshi", plan=plan.__dict__)
+                results.append({"ticker": r.ticker, "status": "blocked",
+                                "reason": "insufficient balance on Kalshi"})
+                break
             # Unknown whether it reached the exchange: never auto-resubmit; the next
             # cycle reconciles positions from Kalshi before doing anything else.
             state.consecutive_errors += 1

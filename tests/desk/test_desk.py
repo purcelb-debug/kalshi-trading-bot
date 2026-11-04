@@ -166,7 +166,9 @@ def test_meeting_cap_blocks_extra_meetings(synth, sim_engine, tmp_path):
     dep = register_desk(sim_engine, cfg, series=SERIES, horizon_h=6.0)
     loop = LoopConfig(dep, report_dir=cfg.report_dir)
     client = FakeClient(_buy_everything)
-    day = pd.Timestamp(AS_OF).normalize() + pd.Timedelta(days=1)
+    # The trading day starts at midnight US Eastern.
+    day = (pd.Timestamp(AS_OF).tz_convert("America/New_York").normalize()
+           + pd.Timedelta(days=1)).tz_convert("UTC")
     init_desk_db(sim_engine)
     with sim_engine.begin() as c:                      # today's one meeting already happened
         c.execute(desk_meetings.insert().values(deployment=dep, ts=day.to_pydatetime(),
@@ -257,6 +259,23 @@ def test_meeting_cap_is_shared_across_desk_deployments(sim_engine):
                                                     tickers_json=[], transcript=""))
     assert meetings_today(sim_engine, now) == 3
     assert meetings_today(sim_engine, now + pd.Timedelta(days=1)) == 0
+
+
+def test_meeting_cap_skips_scanner_only_meetings_and_uses_eastern_day(sim_engine):
+    from desk.cycle import init_desk_db, meetings_today
+    init_desk_db(sim_engine)
+    scan = {"role": "SCANNER", "model": "m"}
+    full = [scan, {"role": "NEWS", "model": "m"}]
+    # 23:30 UTC on Nov 1 is 6:30 PM Eastern: still Nov 1's trading day.
+    late = pd.Timestamp("2026-11-01 23:30", tz="UTC")
+    with sim_engine.begin() as c:
+        for usage in ([scan], [scan, scan], full, full):
+            c.execute(desk_meetings.insert().values(deployment="d", ts=late.to_pydatetime(),
+                                                    tickers_json=[], usage_json=usage,
+                                                    transcript=""))
+    assert meetings_today(sim_engine, late) == 2                   # Scanner-only: free
+    assert meetings_today(sim_engine, pd.Timestamp("2026-11-02 04:00", tz="UTC")) == 2
+    assert meetings_today(sim_engine, pd.Timestamp("2026-11-02 06:00", tz="UTC")) == 0
 
 
 def _scan_rows():

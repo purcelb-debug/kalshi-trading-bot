@@ -78,12 +78,18 @@ def register_desk(sim: Engine, cfg: DeskSettings, *, series: str, horizon_h: flo
     return dv
 
 
+def _day_start(now) -> pd.Timestamp:
+    """Start of the trading day (midnight US Eastern), the same day the executor uses."""
+    return pd.Timestamp(to_utc(now)).tz_convert("America/New_York").normalize()
+
+
 def meetings_today(sim: Engine, now) -> int:
-    """Meetings held today by every desk deployment (the cap is shared)."""
-    day = pd.Timestamp(now).normalize()
+    """Meetings held today by every desk deployment (the cap is shared). A meeting the
+    Scanner ended with NOTHING UNUSUAL (only Scanner calls) is nearly free and doesn't count."""
     with sim.connect() as c:
-        return int(c.execute(select(func.count()).select_from(desk_meetings).where(
-            desk_meetings.c.ts >= to_utc(day))).scalar() or 0)
+        rows = c.execute(select(desk_meetings.c.usage_json).where(
+            desk_meetings.c.ts >= to_utc(_day_start(now)))).scalars().all()
+    return sum(1 for u in rows if {x.get("role") for x in u or []} != {"SCANNER"})
 
 
 def meeting_cost(usage: list[dict], cfg: DeskSettings) -> float:
@@ -99,10 +105,9 @@ def meeting_cost(usage: list[dict], cfg: DeskSettings) -> float:
 
 def spend_today(sim: Engine, cfg: DeskSettings, now) -> float:
     """Estimated LLM spend today across every desk deployment (the budget is shared)."""
-    day = pd.Timestamp(now).normalize()
     with sim.connect() as c:
         rows = c.execute(select(desk_meetings.c.usage_json).where(
-            desk_meetings.c.ts >= to_utc(day))).scalars().all()
+            desk_meetings.c.ts >= to_utc(_day_start(now)))).scalars().all()
     return sum(meeting_cost(u, cfg) for u in rows)
 
 
