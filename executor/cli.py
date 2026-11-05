@@ -193,5 +193,26 @@ def live_test_order(ticker: str = typer.Option(...),
         c.close()
 
 
+@app.command()
+def perf(days: int | None = typer.Option(None, min=1),
+         json_output: bool = typer.Option(False, "--json")):
+    """Report settled trades, early exits and open positions from local files only."""
+    import json
+    from datetime import UTC, datetime
+
+    from executor.performance import format_report, load_report
+
+    cfg = ExecutorSettings()
+    sim_url = cfg.sim_db_url
+    if not sim_url.startswith("sqlite:///"):
+        raise typer.BadParameter("perf requires a local sqlite sim_db_url")
+    report = load_report(cfg.data_dir, sim_url.removeprefix("sqlite:///"), days)
+    payload = json.dumps(report, indent=2, allow_nan=False)
+    path = Path("reports") / f"perf-{datetime.now(UTC):%Y-%m-%d}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(payload + "\n", encoding="utf-8")
+    typer.echo(payload if json_output else format_report(report))
+
+
 if __name__ == "__main__":
     app()
