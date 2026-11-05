@@ -93,6 +93,14 @@ class KalshiTradingClient:
         d = self._call("GET", "/portfolio/balance")
         return float(d["balance_dollars"]), float(d.get("portfolio_value", 0)) / 100.0
 
+    def cash_by_exchange(self) -> dict[int, float]:
+        """Available cash per Kalshi exchange (``balance_breakdown``). A market can only use
+        the cash on its own exchange (``exchange_index`` on the market), e.g. weather on 0,
+        crypto and commodities on 2 (seen 2026-11-04)."""
+        d = self._call("GET", "/portfolio/balance")
+        return {int(b["exchange_index"]): float(b["balance"])
+                for b in d.get("balance_breakdown") or []}
+
     def positions(self) -> list[dict]:
         out, cursor = [], None
         while True:

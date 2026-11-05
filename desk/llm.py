@@ -16,6 +16,7 @@ def make_client(cfg: DeskSettings, provider: str):
         if cfg.tavily_api_key:          # free search run by code for News and Skeptic
             client.searcher = TavilySearch(cfg.tavily_api_key,
                                            daily_cap=cfg.search_daily_cap,
+                                           monthly_cap=cfg.search_monthly_cap,
                                            usage_path=cfg.search_usage_path)
         if cfg.groq_api_key:            # free backup once Gemini's daily quotas run out
             from desk.groq import GroqRest

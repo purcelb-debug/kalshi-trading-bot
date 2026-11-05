@@ -8,13 +8,17 @@ model inside a block that says so, and it can only ever influence a probability,
 size or a limit (see desk.validate).
 """
 
+import calendar
 import json
+import math
 from datetime import UTC, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 
 URL = "https://api.tavily.com/search"
+ET = ZoneInfo("America/New_York")      # the trading day, as in the executor
 SNIPPET_CHARS = 1500
 
 
@@ -30,25 +34,43 @@ class SearchUnavailable(RuntimeError):
 
 class TavilySearch:
     def __init__(self, api_key: str, *, daily_cap: int, usage_path: str,
-                 max_results: int = 3, transport: httpx.BaseTransport | None = None,
+                 monthly_cap: int | None = None, max_results: int = 3,
+                 transport: httpx.BaseTransport | None = None,
                  clock=lambda: datetime.now(UTC)):
         self._key, self.daily_cap, self.max_results = api_key, daily_cap, max_results
+        self.monthly_cap = monthly_cap
         self._usage, self._clock = Path(usage_path), clock
         self._http = httpx.Client(transport=transport, timeout=30)
         self._cache: dict[str, list[dict]] = {}
 
+    def _now(self) -> datetime:
+        return self._clock().astimezone(ET)
+
     def _today(self) -> str:
-        return self._clock().date().isoformat()
+        return self._now().date().isoformat()
+
+    def _counts(self) -> dict:
+        return json.loads(self._usage.read_text(encoding="utf-8")) if self._usage.is_file()             else {}
 
     def used_today(self) -> int:
-        if not self._usage.is_file():
-            return 0
-        d = json.loads(self._usage.read_text(encoding="utf-8"))
-        return int(d.get(self._today(), 0))
+        return int(self._counts().get(self._today(), 0))
+
+    def allowance(self) -> int:
+        """Searches allowed so far today. The day's share is the month's remainder spread
+        over the days left (never more than daily_cap), released evenly through the day so
+        the evening's meetings get searches too."""
+        now, today = self._now(), self._today()
+        cap = self.daily_cap
+        if self.monthly_cap is not None:
+            before = sum(v for k, v in self._counts().items()
+                         if k[:8] == today[:8] and k < today)
+            days_left = calendar.monthrange(now.year, now.month)[1] - now.day + 1
+            cap = min(cap, max(0, self.monthly_cap - before) // days_left)
+        frac = (now.hour * 3600 + now.minute * 60 + now.second + 1) / 86400
+        return min(cap, math.ceil(cap * frac))
 
     def _count(self) -> None:
-        d = json.loads(self._usage.read_text(encoding="utf-8")) if self._usage.is_file() else {}
-        d = {k: v for k, v in d.items() if k >= self._today()[:8]}   # keep this month only
+        d = {k: v for k, v in self._counts().items() if k >= self._today()[:8]}  # this month
         d[self._today()] = d.get(self._today(), 0) + 1
         self._usage.parent.mkdir(parents=True, exist_ok=True)
         self._usage.write_text(json.dumps(d), encoding="utf-8")
@@ -61,6 +83,9 @@ class TavilySearch:
             raise SearchUnavailable("TAVILY_API_KEY is not set")
         if self.used_today() >= self.daily_cap:
             raise SearchUnavailable(f"daily search cap {self.daily_cap} reached")
+        if self.used_today() >= self.allowance():
+            raise SearchUnavailable(f"search allowance so far today ({self.allowance()}) "
+                                    "used; more are released through the day")
         r = self._http.post(URL, headers={"Authorization": f"Bearer {self._key}"},
                             json={"query": query[:400], "search_depth": "basic",
                                   "max_results": self.max_results, "topic": "general",

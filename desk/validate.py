@@ -47,10 +47,40 @@ def _exits(r: _Row, gap: float) -> tuple[float | None, float | None, str]:
     return round(tp, 2), round(st, 2), ""
 
 
+def book_exits(r: _Row, p: float, book: tuple[float, float], gap: float
+               ) -> tuple[str, float, float, str]:
+    """(side, take_profit, stop, note) from the live book, in the price of the side the
+    executor will actually buy (YES if p > mid, else NO). The desk's own levels are kept
+    when they bracket the entry by at least spread + gap; levels written in the other
+    side's price are flipped; otherwise code sets them: take profit after about two thirds
+    of the expected edge, stop once the price has moved the whole edge against us."""
+    bid, ask = book
+    side = "yes" if p > (bid + ask) / 2 else "no"
+    entry, p_side = (ask, p) if side == "yes" else (1 - bid, 1 - p)
+    room = (ask - bid) + gap
+    ok = lambda tp, st: tp is not None and st is not None and tp >= entry + room \
+        and st <= entry - room and 0.01 <= st < tp <= 0.99
+    tp, st, note = r.take_profit, r.stop, ""
+    if not ok(tp, st):
+        flipped = (1 - tp, 1 - st) if tp is not None and st is not None else None
+        if flipped and ok(*flipped):
+            tp, st = flipped
+            note = f"{r.ticker}: exit levels were in the other side's price, flipped"
+        else:
+            edge = max(p_side - entry, 0.0)
+            tp = min(0.99, entry + max(room, edge * 2 / 3))
+            st = max(0.01, entry - max(room, edge))
+            note = f"{r.ticker}: exit levels set by code (desk gave {r.take_profit}/{r.stop})"
+    return side, round(tp, 2), round(st, 2), note
+
+
 def parse_trades(lead_text: str, allowed: dict[str, str], *, max_buys: int,
-                 p_floor: float, exit_gap: float = 0.03) -> tuple[list[Decision], list[str]]:
+                 p_floor: float, exit_gap: float = 0.03,
+                 books: dict[str, tuple[float, float]] | None = None
+                 ) -> tuple[list[Decision], list[str]]:
     """(BUY decisions to record, notes on everything dropped). ``allowed`` maps each ticker
-    shown to the desk to its event. Malformed output means no trades."""
+    shown to the desk to its event. ``books`` (ticker -> YES bid, ask) lets code check
+    or set every exit level. Malformed output means no trades."""
     try:
         tail = lead_text[lead_text.rindex("TRADES:") + len("TRADES:"):]
         rows = json.loads(tail[tail.index("["): tail.rindex("]") + 1])
@@ -81,8 +111,12 @@ def parse_trades(lead_text: str, allowed: dict[str, str], *, max_buys: int,
             continue
         events.add(allowed[r.ticker])
         p = min(max(r.p_yes, p_floor), 1.0 - p_floor)
-        tp, st, why = _exits(r, exit_gap)
+        side = r.side.lower()
+        if books and r.ticker in books:
+            side, tp, st, why = book_exits(r, p, books[r.ticker], exit_gap)
+        else:
+            tp, st, why = _exits(r, exit_gap)
         if why:
             notes.append(why)
-        out.append(Decision(r.ticker, p, r.side.lower(), r.reason[:300], tp, st))
+        out.append(Decision(r.ticker, p, side, r.reason[:300], tp, st))
     return out, notes

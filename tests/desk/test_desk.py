@@ -3,7 +3,7 @@ cycle on synthetic data through the shared paper record."""
 
 import json
 import re
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace as NS
 
 import pandas as pd
@@ -531,12 +531,13 @@ def test_search_cap_and_quota_errors_degrade_to_no_search(tmp_path):
         return (httpx.Response(432, json={"detail": {"error": "plan limit"}}) if len(calls) > 2
                 else httpx.Response(200, json={"results": []}))
 
+    late = lambda: datetime(2026, 11, 5, 4, 30, tzinfo=UTC)     # 11:30 PM Eastern
     s = TavilySearch("k", daily_cap=5, usage_path=str(tmp_path / "u.json"),
-                     transport=httpx.MockTransport(tavily))
+                     transport=httpx.MockTransport(tavily), clock=late)
     _, n, note = s.run(["a", "b", "c", "d"])
     assert n == 2 and "Tavily HTTP 432" in note and s.used_today() == 2
     capped = TavilySearch("k", daily_cap=2, usage_path=str(tmp_path / "u.json"),
-                          transport=httpx.MockTransport(tavily))
+                          transport=httpx.MockTransport(tavily), clock=late)
     _, n2, note2 = capped.run(["x"])
     assert n2 == 0 and "daily search cap 2 reached" in note2 and len(calls) == 3
     assert TavilySearch("", daily_cap=5, usage_path=str(tmp_path / "v.json")).run(["q"])[1] == 0
@@ -584,8 +585,18 @@ def test_groq_backup_takes_over_when_every_gemini_model_is_out():
     assert sent[0]["reasoning_effort"] == "high" and usage[0]["output_tokens"] == 7
     text2, _ = g.ask(gem, cfg, "LEAD", "s", "c", model=cfg.model, effort="medium", search=False)
     assert text2 == "from qwen/qwen3.8-27b"                 # 413 on gpt-oss: next model
-    assert "openai/gpt-oss-120b" in g.EXHAUSTED and "reasoning_effort" not in sent[-1]
+    assert "reasoning_effort" not in sent[-1]
+    # Too large is a one-off: gpt-oss stays in the chain for smaller requests. Groq is
+    # tried ahead of the flash-lite models, so those were never called.
+    assert g.EXHAUSTED == {"gemini-3.8-flash", "gemini-3.6-flash"}
+    text3, _ = g.ask(gem, cfg, "RISK", "s", "c", model=cfg.model, effort="low", search=False)
+    assert text3 == "from openai/gpt-oss-120b"
+    assert g._chain(cfg, cfg.model, NS(backup=1))[:2] == ["openai/gpt-oss-120b",
+                                                           "qwen/qwen3.8-27b"]
     g.EXHAUSTED.clear()
+    assert g._chain(cfg, cfg.model, NS(backup=1)) == [
+        "gemini-3.8-flash", "gemini-3.6-flash", "openai/gpt-oss-120b", "qwen/qwen3.8-27b",
+        "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 
 
 def test_cycle_all_holds_back_to_back_broad_meetings_up_to_the_run_limit(monkeypatch):
@@ -607,3 +618,163 @@ def test_cycle_all_holds_back_to_back_broad_meetings_up_to_the_run_limit(monkeyp
     r = CliRunner().invoke(cli.app, ["cycle", "--all"])
     assert r.exit_code == 0, r.output
     assert calls == [("desk@ALL-h48", True)] * 3                # 3 meetings, then stops
+
+
+def test_search_allowance_spreads_the_month_over_days_and_hours(tmp_path):
+    import httpx
+
+    from desk.search import TavilySearch
+    usage = tmp_path / "u.json"
+    usage.write_text(json.dumps({"2026-11-01": 100, "2026-11-02": 100, "2026-11-03": 100}))
+    t = {"now": datetime(2026, 11, 4, 5, 30, tzinfo=UTC)}           # 12:30 AM Eastern
+    s = TavilySearch("k", daily_cap=60, monthly_cap=1000, usage_path=str(usage),
+                     transport=httpx.MockTransport(lambda r: httpx.Response(
+                         200, json={"results": []})), clock=lambda: t["now"])
+    # 700 left over 27 days (Nov 4-30) = 25 today, released through the Eastern day.
+    assert s.allowance() == 1
+    _, n, note = s.run(["a", "b"])
+    assert n == 1 and "allowance so far today (1)" in note
+    t["now"] = datetime(2026, 11, 4, 17, 0, tzinfo=UTC)             # noon Eastern
+    assert s.allowance() == 13
+    t["now"] = datetime(2026, 11, 5, 4, 59, tzinfo=UTC)             # 11:59 PM Eastern
+    assert s.allowance() == 25 and s.used_today() == 1
+    usage.write_text(json.dumps({"2026-11-01": 1000}))
+    assert s.allowance() == 0                                        # month used up
+
+
+def test_spot_reads_crypto_futures_and_nws_into_the_scan_table():
+    from desk.scan import scan_text
+    from desk.spot import Spot, annotate, classify, market_day, weather_city
+    assert classify("KXBTCD-26NOV0517-T79499.99") == ("crypto", "BTC")
+    assert classify("KXINXU-26NOV04H1600-T7539.9999") == ("yahoo", "KXINX")
+    assert classify("KXNASDAQ100U-26NOV04H1600-T1") == ("yahoo", "KXNASDAQ100")
+    assert weather_city("KXHIGHTTTN-26NOV05-B60.5") == ("high", "TTN")
+    assert weather_city("KXHIGHNY-26NOV05-T70") == ("high", "NY")
+    assert weather_city("KXLOWTNOLA-26NOV04-B63.5") == ("low", "NOLA")
+    assert weather_city("KXRAIN-26NOV05-HOU") == ("rain", "HOU")
+    assert classify("KXRAINELECTION-03NOV26-LEX") is None and classify("KXLIGAX-1") is None
+    assert str(market_day("KXHIGHNY-26NOV05-T70")) == "2026-11-05"
+
+    def get(url, params=None):
+        if "coinbase" in url:
+            body = {"data": {"amount": "80385.065"}}
+        elif "yahoo" in url:
+            body = {"chart": {"result": [{"meta": {"regularMarketPrice": 4071.8,
+                                                   "regularMarketTime": 1793834607}}]}}
+        elif "/points/" in url:
+            body = {"properties": {"forecast": "https://api.weather.gov/gridpoints/X/1,1/f"}}
+        elif "gridpoints" in url:
+            body = {"properties": {"periods": [
+                {"name": "Tonight", "startTime": "2026-11-04T18:00:00-05:00",
+                 "isDaytime": False, "temperature": 60, "temperatureUnit": "F",
+                 "probabilityOfPrecipitation": {"value": 2}},
+                {"name": "Thursday", "startTime": "2026-11-05T06:00:00-05:00",
+                 "isDaytime": True, "temperature": 71, "temperatureUnit": "F",
+                 "probabilityOfPrecipitation": {"value": 46}}]}}
+        else:
+            raise RuntimeError("down")
+        return NS(json=lambda: body, raise_for_status=lambda: None)
+
+    got = annotate(["KXBTCD-26NOV0517-T1", "KXGOLDD-26NOV0517-T3994",
+                    "KXHIGHNY-26NOV05-T70", "KXLOWTNYC-26NOV05-B59.5", "KXRAIN-26NOV05-NYC",
+                    "KXOTHER-26NOV05-X"], Spot(get=get))
+    assert got["KXBTCD-26NOV0517-T1"] == "BTC spot 80,385.07 USD (Coinbase)"
+    assert got["KXGOLDD-26NOV0517-T3994"].startswith("gold front-month futures 4,071.80")
+    assert got["KXHIGHNY-26NOV05-T70"] == "NWS forecast NY Nov 05: high 71°F"
+    assert got["KXLOWTNYC-26NOV05-B59.5"] == "NWS forecast NYC Nov 05: overnight low 60°F"
+    assert got["KXRAIN-26NOV05-NYC"] == "NWS forecast NYC Nov 05: chance of rain Thursday 46%"
+    assert "KXOTHER-26NOV05-X" not in got
+
+    def broken(url, params=None):
+        raise OSError("offline")
+    assert annotate(["KXBTCD-26NOV0517-T1"], Spot(get=broken)) == {}   # blank, never fails
+
+    t = pd.DataFrame([{"ticker": "KXBTCD-1", "event_ticker": "E", "title": "BTC above 79,500",
+                       "hours_to_close": 5.0, "market_mid": 0.6, "spread": 0.02,
+                       "volume_24h": 900, "underlying": "BTC spot 80,385.07 USD (Coinbase)"},
+                      {"ticker": "KXZ-1", "event_ticker": "F", "title": "z", "hours_to_close": 5.0,
+                       "market_mid": 0.5, "spread": 0.02, "volume_24h": 10,
+                       "underlying": float("nan")}])
+    text = scan_text(t, pd.Timestamp("2026-11-04 20:00", tz="UTC"))
+    assert "| underlying now" in text and "Treat it as HARD data" in text
+    assert text.endswith("| BTC spot 80,385.07 USD (Coinbase)\nKXZ-1 | F | z | 5.0 | 0.50 | "
+                         "0.02 | 10 | n/a")
+
+
+def test_scan_excludes_soccer_and_college_football():
+    from desk.scan import filter_rank
+    base = {"title": "x", "close_time": "2026-11-05T20:00:00Z", "yes_bid": 0.4, "yes_ask": 0.42,
+            "volume": 500, "volume_24h": 500, "open_interest": 1}
+    raw = pd.DataFrame([{**base, "ticker": t, "event_ticker": t} for t in (
+        "KXLIGAEXPTOTAL-26NOV04VDSATM-6", "KXNCAAFSPREAD-26NOV05A-B", "KXEFLCHAMPIONSHIPGAME-1",
+        "KXGOLDD-26NOV0517-T3994")])
+    got = filter_rank(raw, DeskSettings(_env_file=None), exclude=set(),
+                      now=pd.Timestamp("2026-11-04 20:00", tz="UTC"))
+    assert got["ticker"].tolist() == ["KXGOLDD-26NOV0517-T3994"]
+
+
+def test_broad_desk_sees_markets_again_after_hours_but_never_what_it_bought(sim_engine):
+    from desk.cycle import _shown, init_desk_db
+    init_desk_db(sim_engine)
+    now = pd.Timestamp("2026-11-05 00:00", tz="UTC")
+    rows = [(now - pd.Timedelta(hours=6), ["OLD", "BOUGHT"], [{"ticker": "BOUGHT"}], [{"r": 1}]),
+            (now - pd.Timedelta(hours=1), ["RECENT"], [], [{"r": 1}]),
+            (now - pd.Timedelta(hours=1), ["CRASHED"], [], [])]         # no model answered
+    with sim_engine.begin() as c:
+        for ts, tickers, decisions, usage in rows:
+            c.execute(desk_meetings.insert().values(
+                deployment="d", ts=ts.to_pydatetime(), tickers_json=tickers,
+                decisions_json=decisions, usage_json=usage, transcript=""))
+    assert _shown(sim_engine, "d", since=now - pd.Timedelta(hours=4)) == {"BOUGHT", "RECENT"}
+    assert _shown(sim_engine, "d") == {"OLD", "BOUGHT", "RECENT"}       # fixed-series desks
+    assert DeskSettings(_env_file=None).scan_reshow_hours == 4.0
+
+
+def test_re_review_shows_named_markets_again_and_withdraws_what_it_no_longer_buys(
+        sim_engine, tmp_path):
+    from executor.runner import latest_forecasts
+    cfg = _claude(report_dir=str(tmp_path / "r"))
+    dep = register_desk(sim_engine, cfg, series="ALL", horizon_h=48)
+    loop = LoopConfig(dep, report_dir=cfg.report_dir)
+    now = pd.Timestamp("2026-11-02 12:00", tz="UTC")
+    buy = {"ticker": "OK", "action": "BUY", "side": "yes", "p_yes": 0.75, "reason": "x"}
+    first = FakeClient(lambda kw: _lead([buy, {**buy, "ticker": "BIG-0"}])
+                       if "DESK LEAD" in kw["system"] else "notes")
+    run_desk_cycle(None, sim_engine, cfg, loop, clients={"claude": first}, now=now,
+                   scan_fetch=_scan_rows)
+    assert set(latest_forecasts(sim_engine, dep, 1e6)["ticker"]) == {"OK", "BIG-0"}
+    # Re-review: both were already shown (normally hidden for hours); now only OK is a BUY.
+    second = FakeClient(lambda kw: _lead([buy]) if "DESK LEAD" in kw["system"] else "notes")
+    out = run_desk_cycle(None, sim_engine, cfg, loop, clients={"claude": second},
+                         now=now + pd.Timedelta(minutes=20), scan_fetch=_scan_rows,
+                         review=["OK", "BIG-0"])
+    assert out["desk"]["status"] == "meeting_held"
+    assert "BIG-1" not in second.calls[0]["messages"][0]["content"]       # only those named
+    assert latest_forecasts(sim_engine, dep, 1e6)["ticker"].tolist() == ["OK"]
+
+
+def test_code_checks_flips_or_sets_exit_levels_from_the_live_book():
+    rows = [
+        # YES at ask 0.40: desk levels bracket the entry by more than spread + gap: kept
+        {"ticker": "A-1", "action": "BUY", "side": "yes", "p_yes": 0.70, "take_profit": 0.55,
+         "stop": 0.30},
+        # NO (p below mid): desk wrote YES prices (take profit 0.42 = NO 0.58), flipped
+        {"ticker": "B-1", "action": "BUY", "side": "no", "p_yes": 0.20, "take_profit": 0.42,
+         "stop": 0.62},
+        # YES but both levels below the entry (Atlanta, 2026-11-04): set by code
+        {"ticker": "C-1", "action": "BUY", "side": "yes", "p_yes": 0.60, "take_profit": 0.30,
+         "stop": 0.20},
+        # no levels and a side the numbers contradict: side follows p vs mid
+        {"ticker": "D-1", "action": "BUY", "side": "yes", "p_yes": 0.10},
+    ]
+    allowed = {r["ticker"]: r["ticker"][0] for r in rows}
+    books = {"A-1": (0.38, 0.40), "B-1": (0.50, 0.52), "C-1": (0.38, 0.40), "D-1": (0.50, 0.52)}
+    ds, notes = parse_trades(_lead(rows), allowed, max_buys=5, p_floor=0.02, books=books)
+    got = {d.ticker: (d.side, d.take_profit, d.stop) for d in ds}
+    assert got["A-1"] == ("yes", 0.55, 0.30)
+    assert got["B-1"] == ("no", 0.58, 0.38) and any("flipped" in n for n in notes)
+    # entry 0.40, edge 0.20: take profit after 2/3 of it, stop after all of it
+    assert got["C-1"] == ("yes", 0.53, 0.20)
+    # NO at 1 - 0.50 = 0.50, edge 0.40: 0.50 + 0.27, 0.50 - 0.40
+    assert got["D-1"] == ("no", 0.77, 0.10)
+    assert sum("set by code" in n for n in notes) == 2

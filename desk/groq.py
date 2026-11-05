@@ -66,8 +66,10 @@ class GroqRest:
                 self._sleep(wait + 0.5)          # per-minute budget refills quickly
                 continue
             break
-        if r.status_code in (413, 429):
-            raise GroqHTTPError(429, r.text)    # too large or out of quota: next model
+        if r.status_code == 413 or (r.status_code == 429 and "tokens per minute" in r.text):
+            raise GroqHTTPError(413, r.text)    # too large for the minute: next model, this once
+        if r.status_code == 429:
+            raise GroqHTTPError(429, r.text)    # out of daily quota: next model
         if r.status_code != 200:
             raise GroqHTTPError(r.status_code, r.text)
         d = r.json()

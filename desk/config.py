@@ -29,6 +29,8 @@ class DeskSettings(BaseSettings):
     #: Free backup after every Gemini model is out for the day (Groq: ~1,000 requests a day,
     #: 8,000 tokens a minute). Used only when GROQ_API_KEY is set.
     groq_models: list[str] = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"]
+    #: Groq's strongest model is tried ahead of these Gemini models (weaker than gpt-oss-120b).
+    groq_before: list[str] = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
     groq_api_key: str = Field(default="", validation_alias=AliasChoices(
         "GROQ_API_KEY", "groq_api_key"))
     search_provider: Literal["claude", "gemini"] = "gemini"
@@ -45,13 +47,15 @@ class DeskSettings(BaseSettings):
         "TAVILY_API_KEY", "tavily_api_key"))
     searches_per_role: int = Field(default=3, ge=1)
     search_daily_cap: int = Field(default=30, ge=0)
+    #: Tavily's free plan (calendar month assumed).
+    search_monthly_cap: int = Field(default=1000, ge=0)
     search_usage_path: str = str(ROOT / "data" / "desk_search_usage.json")
     #: Time limits so one slow call can't eat the job's step: per LLM request, and per meeting
     #: (the meeting stops after the role that crosses it and is recorded as aborted).
     call_timeout_s: float = Field(default=180.0, gt=0)
     meeting_deadline_s: float = Field(default=600.0, gt=0)
     role_timeout_s: float = Field(default=240.0, gt=0)   # hard limit per role, all retries
-    max_meetings_per_cycle: int = Field(default=2, ge=1)
+    max_meetings_per_cycle: int = Field(default=1, ge=1)
     #: Hard caps per UTC day across ALL desk deployments combined: meetings, and estimated
     #: LLM spend in dollars (measured token use x ``prices``, plus web searches).
     max_meetings_per_day: int = Field(default=24, ge=1)
@@ -75,8 +79,15 @@ class DeskSettings(BaseSettings):
     #: Prefixes excluded from broad scan (sports/esports where LLM lacks edge and triggers clustering).
     scan_exclude_prefixes: list[str] = [
         "KXLOL", "KXCS2", "KXDOTA", "KXBRASIL", "KXAPFD", "KXUCL", "KXNCAAMB",
-        "KXNCAAWB", "KXNBB", "KXDIMAYOR", "KXECULP", "KXNHL", "KXNBA", "KXNFL", "KXMLB"
+        "KXNCAAWB", "KXNBB", "KXDIMAYOR", "KXECULP", "KXNHL", "KXNBA", "KXNFL", "KXMLB",
+        "KXLIGA", "KXEFL", "KXEPL", "KXLALIGA", "KXSERIEA", "KXBUNDESLIGA", "KXLIGUE1",
+        "KXMLS", "KXUEL", "KXUECL", "KXAFCCL", "KXEUROCUP", "KXNCAAF", "KXFIBA", "KXKHL"
     ]
+    #: The broad desk sees a market again this many hours after it was last shown (never
+    #: one it bought), so a market first seen without data gets another look.
+    scan_reshow_hours: float = Field(default=4.0, gt=0)
+    #: Annotate scanned markets with live spot values from Coinbase/Yahoo/NWS.
+    scan_spot: bool = Field(default=True, description="Annotate scanned markets with live spot values")
     #: Exit levels from the desk are clipped to these price bounds (price of the side held).
     exit_min_gap: float = Field(default=0.03, gt=0)
     max_picks: int = Field(default=3, ge=1)               # markets the Scanner may pick

@@ -4,6 +4,7 @@ every desk deployment, then one executor cycle per LIVE deployment (mode from
 executor/.env; the safety caps are shared across them), a ledger sync, and a notification
 digest. Output is appended to data/logs/loop.log."""
 
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -32,9 +33,31 @@ STEPS = (
 )
 
 
+def _try_lock(fh) -> bool:
+    """Non-blocking OS lock, released by the OS if this process dies."""
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
 def main() -> int:
     log_path = ROOT / "data" / "logs" / "loop.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    # One job at a time (Task Scheduler, the control panel's run button, a manual run):
+    # two at once hold duplicate meetings and race each other's orders.
+    lock = (ROOT / "data" / "run_loop.lock").open("a+b")
+    if not _try_lock(lock):
+        with log_path.open("a", encoding="utf-8") as log:
+            log.write(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} skipped: another run is "
+                      "still going =====\n")
+        return 0
     worst = 0
     with log_path.open("a", encoding="utf-8") as log:
         log.write(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} =====\n")

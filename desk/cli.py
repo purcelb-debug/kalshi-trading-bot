@@ -42,7 +42,9 @@ def register(series: str = typer.Option(...), horizon: float = 30.0):
 @app.command()
 def cycle(deployment: str = typer.Option("desk@KXHIGHNY-h30"),
           all_: bool = typer.Option(False, "--all", help="every registered desk deployment"),
-          dry: bool = typer.Option(False, "--dry", help="show the table; no LLM calls")):
+          dry: bool = typer.Option(False, "--dry", help="show the table; no LLM calls"),
+          review: str = typer.Option("", help="broad desk: comma-separated tickers to "
+                                     "look at again; a BUY it now passes on is withdrawn")):
     """Hold a meeting if markets newly reached their decision point, then refresh the
     desk's paper record. The predlab loop step collects data first."""
     import json
@@ -85,7 +87,9 @@ def cycle(deployment: str = typer.Option("desk@KXHIGHNY-h30"),
             from desk.cycle import _shown, init_desk_db
             from desk.scan import scan_table, scan_text
             init_desk_db(sim)
-            t = scan_table(cfg, exclude=_shown(sim, deployment), now=now)
+            seen = _shown(sim, deployment,
+                          since=now - pd.Timedelta(hours=cfg.scan_reshow_hours))
+            t = scan_table(cfg, exclude=seen, now=now)
             typer.echo(scan_text(t, now) if len(t) else "no markets pass the scan filters now")
             return
         t = market_table(market, sim, cfg, series=series, horizon=pd.Timedelta(hours=float(h)),
@@ -98,7 +102,8 @@ def cycle(deployment: str = typer.Option("desk@KXHIGHNY-h30"),
         # Hourly job runs this before the owner has opted in: nothing to do, not an error.
         typer.echo(f"{deployment} not registered; run `python -m desk.cli register` to start")
         return
-    out = run_desk_cycle(market, sim, cfg, loop)
+    out = run_desk_cycle(market, sim, cfg, loop,
+                         review=[t.strip() for t in review.split(",") if t.strip()] or None)
     typer.echo(json.dumps({"desk": out["desk"], "gate": out["gate"]}, indent=2, default=str))
 
 

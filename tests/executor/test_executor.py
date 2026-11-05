@@ -472,3 +472,75 @@ def test_insufficient_balance_skips_buys_without_halting(tmp_path):
     assert len(buys) == 3                              # one attempt per cycle, then stop
     st = State.load(tmp_path / "state_live.json")
     assert st.consecutive_errors == 0 and not st.halted
+
+
+def test_orders_use_their_own_exchanges_cash(tmp_path):
+    import pandas as pd
+
+    from executor.client import OrderAck, TradingError
+    from executor.config import GATE_OVERRIDE_PHRASE
+    from executor.runner import run_cycle
+    from predlab.backtest.execution import Quote
+    from predlab.db.repo import init_sim_db, make_engine
+    from predlab.forecasts import record_forecasts
+    from predlab.models.base import Forecast
+    from predlab.timeutil import utcnow
+    sim = make_engine(f"sqlite:///{tmp_path / 'sim.db'}")
+    init_sim_db(sim)
+    now = pd.Timestamp(utcnow())
+    record_forecasts(sim, [Forecast(t, "desk@ALL-h48", 0.80, None, None, now, now, (), {})
+                           for t in ("WX1", "WX2", "BTC")])
+    buys = []
+
+    class Client:
+        def balance_usd(self):
+            return 30.0, 0.0
+
+        def cash_by_exchange(self):
+            return {0: 3.45, 2: 26.55}
+
+        def positions(self):
+            return []
+
+        def place_ioc_buy(self, ticker, outcome, count, max_price):
+            buys.append((ticker, count, max_price))
+            if ticker == "WX1":
+                raise TradingError(400, '{"error":{"code":"insufficient_balance"}}')
+            return OrderAck("o", "c", count, 0.0, 0.41, 0.01)
+
+    book = Quote(now, "book", [(0.40, 500.0)], [(0.41, 500.0)], 0.65, 0.35)
+    cfg = ExecutorSettings(_env_file=None, mode="live", live_key_id="k", live_key_path="p",
+                           data_dir=str(tmp_path), kill_switch_path=str(tmp_path / "KILL"),
+                           bankroll_cap_usd=40, max_order_usd=15, daily_loss_stop_usd=25,
+                           gate_override=GATE_OVERRIDE_PHRASE, attended=False)
+    out = run_cycle(cfg, sim, "desk@ALL-h48", client=Client(), quotes={t: book for t in
+                    ("WX1", "WX2", "BTC")}, exchanges={"WX1": 0, "WX2": 0, "BTC": 2})
+    by = {r["ticker"]: r for r in out}
+    wx1 = next(b for b in buys if b[0] == "WX1")
+    assert wx1[1] * wx1[2] <= 3.45                     # count x limit fits exchange 0's cash
+    assert by["WX1"]["reason"] == "insufficient balance on Kalshi"
+    assert by["WX2"]["status"] == "skipped"            # exchange 0 treated as empty after it
+    assert "BTC" in [b[0] for b in buys] and by["BTC"]["status"] == "filled"   # 2 still trades
+
+
+def test_two_executor_runs_never_overlap(tmp_path):
+    from executor.safety import Busy, exclusive
+    lock = tmp_path / "executor_live.lock"
+    with exclusive(lock), pytest.raises(Busy), exclusive(lock, wait_s=0, sleep=lambda s: None):
+        pass
+    with exclusive(lock):                       # released after the first block
+        pass
+
+
+def test_run_loop_skips_when_another_run_holds_the_lock(tmp_path, monkeypatch):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("run_loop", "scripts/run_loop.py")
+    rl = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rl)
+    monkeypatch.setattr(rl, "ROOT", tmp_path)
+    monkeypatch.setattr(rl, "STEPS", [["-c", "pass"]])
+    (tmp_path / "data").mkdir()
+    held = (tmp_path / "data" / "run_loop.lock").open("a+b")
+    assert rl._try_lock(held)
+    assert rl.main() == 0
+    assert "skipped: another run" in (tmp_path / "data" / "logs" / "loop.log").read_text()

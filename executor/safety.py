@@ -2,6 +2,9 @@
 
 import hashlib
 import json
+import os
+import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -136,3 +139,49 @@ def pre_trade_check(cfg: ExecutorSettings, state: State, *, cost_usd: float, cas
         return Check(False, f"daily loss stop hit (down "
                             f"${state.day_start_value_usd - total_value_usd:.2f})")
     return Check(True)
+
+
+class Busy(RuntimeError):
+    pass
+
+
+@contextmanager
+def exclusive(path: Path, wait_s: float = 0.0, sleep=time.sleep):
+    """Hold an OS file lock on ``path`` for the block, so two executor runs can never
+    trade at once (each could buy a market before seeing the other's position). The OS
+    releases it if the process dies. Raises Busy after ``wait_s`` seconds."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+b") as fh:
+        deadline = time.monotonic() + wait_s
+        while True:
+            try:
+                _lock(fh)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise Busy(f"{path.name} is held by another run") from None
+                sleep(1.0)
+        try:
+            yield
+        finally:
+            _unlock(fh)
+
+
+def _lock(fh) -> None:
+    if os.name == "nt":
+        import msvcrt
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock(fh) -> None:
+    if os.name == "nt":
+        import msvcrt
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)

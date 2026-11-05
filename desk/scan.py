@@ -34,11 +34,14 @@ async def _fetch(horizon_h: float) -> list[dict]:
     return out
 
 
-def filter_rank(raw: pd.DataFrame, cfg: DeskSettings, *, exclude: set[str], now) -> pd.DataFrame:
+def filter_rank(raw: pd.DataFrame, cfg: DeskSettings, *, exclude: set[str], now,
+                only: set[str] | None = None) -> pd.DataFrame:
     """Code-side filters and ranking; pure, so it is tested without the network."""
     if raw.empty:
         return raw
     t = raw.copy()
+    if only is not None:              # a re-review of named markets
+        t = t[t["ticker"].isin(only)]
     t = t[t["yes_bid"].fillna(0).gt(0) & t["yes_ask"].fillna(1).lt(1)]
     t["market_mid"] = (t["yes_bid"] + t["yes_ask"]) / 2
     t["spread"] = t["yes_ask"] - t["yes_bid"]
@@ -58,19 +61,36 @@ def filter_rank(raw: pd.DataFrame, cfg: DeskSettings, *, exclude: set[str], now)
     return t.head(cfg.scan_max_rows).reset_index(drop=True)
 
 
-def scan_table(cfg: DeskSettings, *, exclude: set[str], now, fetch=None) -> pd.DataFrame:
+def scan_table(cfg: DeskSettings, *, exclude: set[str], now, fetch=None,
+               spot=None, only: set[str] | None = None) -> pd.DataFrame:
+    """``spot``: ticker list -> {ticker: underlying text}. Live by default; tests that pass
+    their own ``fetch`` get no lookups unless they pass ``spot`` too."""
     rows = fetch() if fetch is not None else asyncio.run(_fetch(cfg.scan_horizon_h))
-    return filter_rank(pd.DataFrame(rows, columns=COLUMNS), cfg, exclude=exclude, now=now)
+    t = filter_rank(pd.DataFrame(rows, columns=COLUMNS), cfg, exclude=exclude, now=now,
+                    only=only)
+    if spot is None and fetch is None and cfg.scan_spot:
+        from desk.spot import annotate
+        spot = annotate
+    if spot is not None and len(t):
+        t["underlying"] = t["ticker"].map(spot(t["ticker"].tolist()))
+    return t
 
 
 def scan_text(t: pd.DataFrame, now) -> str:
     def f(v, spec=".2f"):
         return "n/a" if pd.isna(v) else format(v, spec)
 
-    rows = ["ticker | event | market | hours to close | mid | spread | 24h volume"]
+    has = "underlying" in t.columns
+    rows = ["ticker | event | market | hours to close | mid | spread | 24h volume"
+            + (" | underlying now" if has else "")]
     for r in t.itertuples():
+        u = (" | " + (r.underlying if isinstance(r.underlying, str) else "n/a")) if has else ""
         rows.append(f"{r.ticker} | {r.event_ticker} | {r.title} | {f(r.hours_to_close, '.1f')} | "
-                    f"{f(r.market_mid)} | {f(r.spread)} | {f(r.volume_24h, '.0f')}")
+                    f"{f(r.market_mid)} | {f(r.spread)} | {f(r.volume_24h, '.0f')}{u}")
+    note = ("\n'underlying now' is a live value fetched by code just now (spot price, futures "
+            "or index level, or the latest NWS forecast). Treat it as HARD data; the official "
+            "settlement source can differ slightly.") if has else ""
     return (f"UTC time: {pd.Timestamp(now):%Y-%m-%d %H:%M}. REAL MONEY (small, capped account).\n"
             f"Open Kalshi markets closing within the next hours, all categories, already "
-            f"filtered for liquidity and ranked by 24h volume.\n\nMARKETS\n" + "\n".join(rows))
+            f"filtered for liquidity and ranked by 24h volume.{note}\n\nMARKETS\n"
+            + "\n".join(rows))

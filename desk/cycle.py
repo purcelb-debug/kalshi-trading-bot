@@ -119,10 +119,21 @@ def desk_deployments(sim: Engine) -> list[str]:
             .order_by(model_registry.c.model_version))]
 
 
-def _shown(sim: Engine, deployment: str) -> set[str]:
+def _shown(sim: Engine, deployment: str, *, since=None) -> set[str]:
+    """Markets already put in front of this desk. With ``since`` (the broad desk), only those
+    shown since then, so a market comes back for another look after a few hours, plus every
+    market it bought. A meeting where no model answered showed nothing."""
+    cut = to_utc(since) if since is not None else None
     with sim.connect() as c:
-        return {t for (ts,) in c.execute(select(desk_meetings.c.tickers_json).where(
-            desk_meetings.c.deployment == deployment)) for t in (ts or [])}
+        rows = c.execute(select(desk_meetings.c.ts, desk_meetings.c.tickers_json,
+                                desk_meetings.c.decisions_json, desk_meetings.c.usage_json)
+                         .where(desk_meetings.c.deployment == deployment)).all()
+    out = set()
+    for ts, tickers, decisions, usage in rows:
+        out |= {d["ticker"] for d in decisions or []}
+        if usage and (cut is None or to_utc(ts) >= cut):
+            out |= set(tickers or [])
+    return out
 
 
 def market_table(market: Engine, sim: Engine, cfg: DeskSettings, *, series: str,
@@ -189,7 +200,7 @@ def _save_transcript(cfg: DeskSettings, deployment: str, now, text: str, *,
 
 def run_desk_cycle(market: Engine, sim: Engine, cfg: DeskSettings, loop: LoopConfig, *,
                    clients: dict | None = None, now=None, scan_fetch=None,
-                   allow_meeting: bool = True) -> dict:
+                   allow_meeting: bool = True, review: list[str] | None = None) -> dict:
     """One cycle. The meeting runs only when markets newly reach their decision point and
     the daily meeting cap allows; the paper record is refreshed every cycle regardless."""
     init_desk_db(sim)
@@ -203,7 +214,10 @@ def run_desk_cycle(market: Engine, sim: Engine, cfg: DeskSettings, loop: LoopCon
     broad = is_broad(params)
     if broad:
         from desk.scan import scan_table, scan_text
-        t = scan_table(cfg, exclude=_shown(sim, loop.deployment), now=now, fetch=scan_fetch)
+        seen = set() if review else _shown(
+            sim, loop.deployment, since=now - pd.Timedelta(hours=cfg.scan_reshow_hours))
+        t = scan_table(cfg, exclude=seen, now=now, fetch=scan_fetch,
+                       only=set(review) if review else None)
     else:
         t = market_table(market, sim, cfg, series=params["series"],
                          horizon=timedelta(hours=params["horizon_h"]),
@@ -228,7 +242,10 @@ def run_desk_cycle(market: Engine, sim: Engine, cfg: DeskSettings, loop: LoopCon
         decisions, notes = parse_trades(meeting.lead_text,
                                         dict(zip(t["ticker"], t["event_ticker"])),
                                         max_buys=cfg.max_buys, p_floor=cfg.p_floor,
-                                        exit_gap=cfg.exit_min_gap)
+                                        exit_gap=cfg.exit_min_gap,
+                                        books={r.ticker: (float(r.yes_bid), float(r.yes_ask))
+                                               for r in t.itertuples()
+                                               if pd.notna(r.yes_bid) and pd.notna(r.yes_ask)})
         mids = dict(zip(t["ticker"], t["market_mid"]))
         items = [Forecast(ticker=d.ticker, model_version=loop.deployment, p=d.p_yes,
                           ci_low=None, ci_high=None, input_max_ts=now, decision_ts=now,
@@ -236,6 +253,15 @@ def run_desk_cycle(market: Engine, sim: Engine, cfg: DeskSettings, loop: LoopCon
                                                     "take_profit": d.take_profit,
                                                     "stop": d.stop})
                  for d in decisions]
+        if review and not meeting.aborted:
+            # A re-review replaces the earlier BUY: a market the desk no longer buys gets a
+            # 'withdrawn' record, which the executor skips (only BUYs are recorded otherwise).
+            bought = {d.ticker for d in decisions}
+            items += [Forecast(ticker=k, model_version=loop.deployment, p=float(mids[k]),
+                               ci_low=None, ci_high=None, input_max_ts=now, decision_ts=now,
+                               dq_flags=(), explanation={"desk": "withdrawn on re-review",
+                                                         "withdrawn": True})
+                      for k in t["ticker"] if k not in bought and pd.notna(mids.get(k))]
         ref = {k: float(v) for k, v in mids.items() if pd.notna(v)}
         recorded = record_forecasts(sim, items, market_ref=ref, created_ts=now) if items else 0
         text = meeting.text() + "\n\n[SYSTEM]\n" + "\n".join(

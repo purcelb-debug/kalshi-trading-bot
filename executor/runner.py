@@ -6,7 +6,10 @@ before submission. In ``live`` mode the go-live gate must be open for the model 
 """
 
 import asyncio
+import json
+import math
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
@@ -16,7 +19,7 @@ from executor.client import KalshiTradingClient, TradingError
 from executor.config import BASE_URLS, ExecutorSettings
 from executor.exits import exit_levels, plan_exit
 from executor.gate import certified_shrink, load_gate
-from executor.safety import AuditLog, State, pre_trade_check, startup_checks
+from executor.safety import AuditLog, Busy, State, exclusive, pre_trade_check, startup_checks
 from predlab.backtest.decision import Plan, plan_order
 from predlab.backtest.execution import MarketData, Quote
 from predlab.backtest.fees import FeeSchedule
@@ -33,9 +36,14 @@ def latest_forecasts(sim_engine: Engine, model_version: str, max_age_hours: floa
            .where(forecasts.c.model_version == model_version, forecasts.c.created_ts >= cutoff)
            .group_by(forecasts.c.ticker).subquery())
     with sim_engine.connect() as c:
-        rows = c.execute(select(forecasts.c.ticker, forecasts.c.p, forecasts.c.created_ts)
+        rows = c.execute(select(forecasts.c.ticker, forecasts.c.p, forecasts.c.created_ts,
+                                forecasts.c.explanation)
                          .join(sub, sub.c.id == forecasts.c.id)).mappings().all()
-    return pd.DataFrame(rows, columns=["ticker", "p", "created_ts"])
+    df = pd.DataFrame(rows, columns=["ticker", "p", "created_ts", "explanation"])
+    # The desk withdrew its BUY on a re-review: nothing to trade.
+    withdrawn = df["explanation"].map(
+        lambda e: bool((json.loads(e) if isinstance(e, str) else (e or {})).get("withdrawn")))
+    return df[~withdrawn.astype(bool)].drop(columns="explanation").reset_index(drop=True)
 
 
 async def fetch_quotes(base_url: str, tickers: list[str]) -> dict[str, Quote]:
@@ -49,11 +57,35 @@ async def fetch_quotes(base_url: str, tickers: list[str]) -> dict[str, Quote]:
     return out
 
 
-def run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, *,
-              client: KalshiTradingClient | None = None,
-              quotes: dict[str, Quote] | None = None,
-              confirm: Callable[[Plan], bool] | None = None,
-              fees: FeeSchedule | None = None, forecast_max_age_h: float = 6.0) -> list[dict]:
+async def fetch_exchanges(base_url: str, tickers: list[str]) -> dict[str, int]:
+    """Market -> the Kalshi exchange whose cash it trades against."""
+    out = {}
+    async with ReadOnlyClient(base_url, allowed_paths=KALSHI_READ_PATHS, reads_per_sec=5) as c:
+        for t in tickers:
+            ex = ((await c.get(f"/markets/{t}")).get("market") or {}).get("exchange_index")
+            if ex is not None:
+                out[t] = int(ex)
+    return out
+
+
+def run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, **kw) -> list[dict]:
+    """One cycle, never two at once: a second run waits up to two minutes, then refuses."""
+    data = Path(cfg.data_dir)
+    try:
+        with exclusive(data / f"executor_{cfg.mode}.lock", wait_s=120):
+            return _run_cycle(cfg, sim_engine, model_version, **kw)
+    except Busy as e:
+        AuditLog(data / f"audit_{cfg.mode}.jsonl").write("cycle_refused", reason=str(e),
+                                                         mode=cfg.mode)
+        return [{"status": "refused", "reason": str(e)}]
+
+
+def _run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, *,
+               client: KalshiTradingClient | None = None,
+               quotes: dict[str, Quote] | None = None,
+               exchanges: dict[str, int] | None = None,
+               confirm: Callable[[Plan], bool] | None = None,
+               fees: FeeSchedule | None = None, forecast_max_age_h: float = 6.0) -> list[dict]:
     data = Path(cfg.data_dir)
     state_path = data / f"state_{cfg.mode}.json"
     state = State.load(state_path)
@@ -142,9 +174,18 @@ def run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, *,
         audit.write("no_forecasts", model_version=model_version)
         state.save(state_path)
         return results + [{"status": "no_forecasts"}]
+    base = BASE_URLS["demo" if cfg.mode == "demo" else "live"]
     if quotes is None:
-        quotes = asyncio.run(fetch_quotes(BASE_URLS["demo" if cfg.mode == "demo" else "live"],
-                                          fc["ticker"].tolist()))
+        quotes = asyncio.run(fetch_quotes(base, fc["ticker"].tolist()))
+    # Kalshi keeps cash per exchange; an order may only use its market's exchange's cash.
+    pools = client.cash_by_exchange() if hasattr(client, "cash_by_exchange") else {}
+    if pools and exchanges is None:
+        try:
+            exchanges = asyncio.run(fetch_exchanges(base, fc["ticker"].tolist()))
+        except Exception as e:  # noqa: BLE001 - unknown exchange: size against all cash
+            audit.write("exchange_lookup_failed", error=str(e)[:200])
+            exchanges = {}
+    exchanges = exchanges or {}
     equity = min(total_value, cfg.bankroll_cap_usd or total_value)
     # Trade exactly as certified: the certified kappa, or the configured shrink if that is
     # more conservative (closer to the market).
@@ -162,16 +203,25 @@ def run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, *,
         if q is None or (utcnow() - q.ts).total_seconds() > cfg.max_quote_age_s:
             results.append({"ticker": r.ticker, "status": "skipped", "reason": "no fresh book"})
             continue
-        plan, why = plan_order(r.ticker, r.p, q, fees, equity=equity, cash=cash,
+        ex = exchanges.get(r.ticker)
+        avail = min(cash, pools[ex]) if ex in pools else cash
+        plan, why = plan_order(r.ticker, r.p, q, fees, equity=equity, cash=avail,
                                min_edge=cfg.min_edge, kelly_fraction=cfg.kelly_fraction,
                                max_order_usd=cfg.max_order_usd, shrink=shrink,
                                min_entry_price=cfg.min_entry_price,
                                max_entry_price=cfg.max_entry_price,
                                min_order_usd=cfg.min_order_usd)
+        if plan is not None and plan.count * plan.max_price > avail:
+            # The exchange may hold the limit price, not the ask, while the IOC order is
+            # checked: keep count x limit inside this exchange's cash.
+            n = math.floor(avail / plan.max_price)
+            plan = replace(plan, count=n, cost_usd=round(plan.cost_usd / plan.count * n, 2)) \
+                if n >= 1 else None
+            why = why or f"not enough cash on exchange {ex}"
         if plan is None:
             results.append({"ticker": r.ticker, "status": "skipped", "reason": why})
             continue
-        chk = pre_trade_check(cfg, state, cost_usd=plan.cost_usd, cash_usd=cash,
+        chk = pre_trade_check(cfg, state, cost_usd=plan.cost_usd, cash_usd=avail,
                               open_exposure_usd=sum(exposure.values()),
                               market_exposure_usd=exposure.get(r.ticker, 0.0),
                               total_value_usd=total_value)
@@ -196,14 +246,18 @@ def run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, *,
             ack = client.place_ioc_buy(r.ticker, plan.outcome, plan.count, plan.max_price)
         except (TradingError, OSError) as e:
             if isinstance(e, TradingError) and "insufficient_balance" in str(e):
-                # Kalshi rejected it outright (nothing reached the book): the cash is in
-                # open positions. Skip buying for the rest of this cycle, but don't count
-                # it toward the error halt, or exits would stop too.
-                audit.write("order_blocked", ticker=r.ticker,
+                # Kalshi rejected it outright (nothing reached the book). Skip this market
+                # and treat its exchange as empty for the rest of the cycle; markets on
+                # other exchanges still trade. Not counted toward the error halt.
+                audit.write("order_blocked", ticker=r.ticker, exchange=ex,
                             reason="insufficient balance on Kalshi", plan=plan.__dict__)
                 results.append({"ticker": r.ticker, "status": "blocked",
                                 "reason": "insufficient balance on Kalshi"})
-                break
+                if ex in pools:
+                    pools[ex] = 0.0
+                else:
+                    break                   # one shared pool, and it's empty
+                continue
             # Unknown whether it reached the exchange: never auto-resubmit; the next
             # cycle reconciles positions from Kalshi before doing anything else.
             state.consecutive_errors += 1
@@ -218,6 +272,8 @@ def run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, *,
         audit.write("order_ack", **ack.__dict__)
         spent = ack.fill_count * plan.max_price
         cash -= spent
+        if ex in pools:
+            pools[ex] -= spent
         exposure[r.ticker] = exposure.get(r.ticker, 0.0) + spent
         results.append({"ticker": r.ticker, "status": "filled" if ack.fill_count else "unfilled",
                         "order_id": ack.order_id, "filled": ack.fill_count})

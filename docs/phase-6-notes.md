@@ -153,3 +153,19 @@ held position, a statistical go-live gate). Only the parts that filled gaps were
   (lines under 25 chars) and keep 1,500 chars from each of 3 results. Before this the NWS
   forecast numbers were cut off and the desk correctly said NO CLEAR INFORMATION; after it,
   gpt-oss-120b found the official Central Park point forecast (HARD, cited) in 5.9s, $0.
+
+## 2026-11-04: meetings with no buys
+
+Finding: 69 full meetings, 0 BUYs. The Tavily cap (60/day, UTC) was used up by 12:07 AM ET,
+so 61 meetings had no search, News wrote NO CLEAR INFORMATION, and the Pricer (which prices
+only HARD/SOFT information) wrote NO EDGE. 409 of 495 role calls ran on gemini-3.5-flash-lite.
+
+Changes:
+- `desk/spot.py`: the broad scan gets an "underlying now" column fetched by code (Coinbase
+  spot for crypto; Yahoo charts for index, futures, FX and 10y yield; NWS forecast for
+  temperature and rain markets). Prompts treat it as HARD data. Failures leave a blank cell.
+- Search pacing: each Eastern day gets the month's remaining Tavily searches spread over the
+  days left (`DESK_SEARCH_MONTHLY_CAP`, default 1000), released evenly through the day.
+- Model order: Groq gpt-oss-120b is tried before the flash-lite models (`groq_before`). A
+  Groq "too large for this minute" error skips the model once instead of for the whole run.
+- Scan excludes soccer leagues, college football, FIBA and KHL.

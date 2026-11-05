@@ -92,6 +92,11 @@ class QuotaExhausted(RuntimeError):
     pass
 
 
+class TooLarge(QuotaExhausted):
+    """This request is over a per-minute token budget (Groq 413): try the next model, but
+    keep this one for smaller requests later in the run."""
+
+
 def _code(e: Exception):
     return getattr(e, "status_code", None) or getattr(e, "code", None)
 
@@ -101,6 +106,8 @@ def _create(client, sleep=time.sleep, **kw):
         try:
             return client.interactions.create(**kw)
         except Exception as e:
+            if _code(e) == 413:
+                raise TooLarge(f"{kw.get('model')}: {str(e)[:160]}") from e
             if _code(e) == 429:
                 raise QuotaExhausted(f"{kw.get('model')}: {str(e)[:160]}") from e
             transient = (_code(e) in (500, 502, 503, 504)
@@ -112,11 +119,13 @@ def _create(client, sleep=time.sleep, **kw):
 
 
 def _chain(cfg: DeskSettings, model: str, client=None) -> list[str]:
-    """The asked-for model first, then the configured Gemini fallbacks, then (if the client
-    has a Groq backup attached) the Groq models; minus models exhausted in this process."""
+    """The asked-for model first, then the configured Gemini fallbacks, with (if the client
+    has a Groq backup attached) the Groq models ahead of the weak ``groq_before`` Gemini
+    models; minus models exhausted in this process."""
     out = [model] + [m for m in cfg.gemini_models if m != model]
     if getattr(client, "backup", None) is not None:
-        out += [m for m in cfg.groq_models if m not in out]
+        at = next((i for i, m in enumerate(out) if i and m in cfg.groq_before), len(out))
+        out[at:at] = [m for m in cfg.groq_models if m not in out]
     return [m for m in out if m not in EXHAUSTED]
 
 
@@ -145,7 +154,8 @@ def ask(client, cfg: DeskSettings, role: str, system: str, chat: str, *, model: 
             return _ask_one(c, cfg, role, system, chat, model=m, effort=effort,
                             search=search)
         except QuotaExhausted as e:
-            EXHAUSTED.add(m)
+            if not isinstance(e, TooLarge):
+                EXHAUSTED.add(m)
             last = e
     raise last or QuotaExhausted("every free model is out of quota")
 
