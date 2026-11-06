@@ -132,7 +132,7 @@ def test_desk_meetings_counted_not_quoted(tmp_path):
     (d / "20261102T1400.txt").write_text("long transcript\nrecorded BUY A-1 p_yes=0.7")
     (d / "20261102T1500.txt").write_text("another long transcript\nno trades")
     (msg,) = build_messages(cfg, state, NOW, _exec())
-    assert msg.endswith("• Desk: 2 meetings, 1 buy") and "transcript" not in msg
+    assert msg.endswith("• Desk: 2 meetings, 1 pick (bot bought 0)") and "transcript" not in msg
     assert build_messages(cfg, state, NOW, _exec()) == []
 
 
@@ -204,3 +204,41 @@ def test_capital_step_needs_trades_and_profit_and_fires_once_per_step():
     assert capital_step(report(45, 6.0), steps, 30) is None          # already told
     assert capital_step(report(70, 9.0), steps, 30)[0] == 60         # next step
     assert capital_step(report(70, 9.0), steps, 0)[0] == 60          # skip straight to the top
+
+
+def test_halt_reminders_downtime_and_desk_picks_vs_buys(tmp_path):
+    cfg, state = _cfg(tmp_path, halt_reminder_hours=3), {}
+    log = AuditLog(tmp_path / "exec" / "audit_live.jsonl")
+    log.write("cycle_end", results=0, halted="")
+    build_messages(cfg, state, NOW, _exec())           # first sight: start at the end
+    halted = "halted: 3 consecutive order errors (clear with `executor resume`)"
+
+    def refuse():
+        log.write("cycle_refused", reason=halted, mode="live")
+
+    refuse()
+    assert "Trading paused: " + halted in build_messages(cfg, state, NOW, _exec())[0]
+    standing = state["audit"]["audit_live.jsonl"]["standing"]
+    standing["reminded"] = (datetime.fromisoformat(standing["reminded"])
+                            - timedelta(hours=3)).isoformat()      # 3h have passed
+    refuse()
+    assert "Still halted, no orders placed: " + halted in build_messages(cfg, state, NOW,
+                                                                         _exec())[0]
+    refuse()
+    assert build_messages(cfg, state, NOW, _exec()) == []          # not again so soon
+    log.write("resume", cleared="3 consecutive order errors")
+    log.write("exchange_unavailable", ticker="T-1", error="409 exchange_is_paused")
+    log.write("exchange_unavailable", ticker="T-1", error="409 exchange_is_paused")
+    refuse()                                          # same words after a resume: news
+    (msg,) = build_messages(cfg, state, NOW, _exec())
+    assert "Trading paused: " + halted in msg
+    assert "Kalshi unavailable (2x), no orders then; retrying each run" in msg
+
+    d = tmp_path / "reports" / "desk-meetings"
+    d.mkdir(parents=True)
+    (d / "20261102T1600.txt").write_text("recorded BUY A-1 p_yes=0.7\nrecorded BUY B-1")
+    log.write("order_submit", mode="live", plan={"ticker": "A-1", "outcome": "yes",
+                                                 "max_price": 0.5})
+    log.write("order_ack", order_id="o1", fill_count=2.0, average_fill_price=0.5)
+    (msg,) = build_messages(cfg, state, NOW, _exec())
+    assert msg.endswith("• Desk: 1 meeting, 2 picks (bot bought 1)")

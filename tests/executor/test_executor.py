@@ -544,3 +544,92 @@ def test_run_loop_skips_when_another_run_holds_the_lock(tmp_path, monkeypatch):
     assert rl._try_lock(held)
     assert rl.main() == 0
     assert "skipped: another run" in (tmp_path / "data" / "logs" / "loop.log").read_text()
+
+
+def _down_setup(tmp_path, exp):
+    import pandas as pd
+
+    from executor.config import GATE_OVERRIDE_PHRASE
+    from predlab.db.repo import init_sim_db, make_engine
+    from predlab.forecasts import record_forecasts
+    from predlab.models.base import Forecast
+    from predlab.timeutil import utcnow
+    sim = make_engine(f"sqlite:///{tmp_path / 'sim.db'}")
+    init_sim_db(sim)
+    now = pd.Timestamp(utcnow())
+    record_forecasts(sim, [Forecast(t, "desk@ALL-h48", 0.80, None, None, now, now, (), exp)
+                           for t in ("A", "B", "C")])
+    cfg = ExecutorSettings(_env_file=None, mode="live", live_key_id="k", live_key_path="p",
+                           data_dir=str(tmp_path), kill_switch_path=str(tmp_path / "KILL"),
+                           bankroll_cap_usd=40, max_order_usd=15, daily_loss_stop_usd=25,
+                           gate_override=GATE_OVERRIDE_PHRASE, attended=False)
+    return sim, cfg, now
+
+
+def test_kalshi_downtime_on_buys_skips_the_cycle_without_halting(tmp_path):
+    from executor.client import TradingError
+    from executor.runner import run_cycle
+    from executor.safety import State
+    from predlab.backtest.execution import Quote
+    sim, cfg, now = _down_setup(tmp_path, {})
+    buys, errors = [], iter([TradingError(409, '{"error":{"code":"exchange_is_paused"}}'),
+                             TradingError(503, '{"error":{"code":"service_unavailable"}}'),
+                             TradingError(409, '{"error":{"code":"exchange_is_paused"}}')]
+                            + [TradingError(400, '{"error":{"code":"invalid_order"}}')] * 3)
+
+    class Client:
+        def balance_usd(self):
+            return 30.0, 0.0
+
+        def positions(self):
+            return []
+
+        def place_ioc_buy(self, *a):
+            buys.append(a[0])
+            raise next(errors)
+
+    book = Quote(now, "book", [(0.40, 500.0)], [(0.41, 500.0)], 0.65, 0.35)
+    for _ in range(3):
+        out = run_cycle(cfg, sim, "desk@ALL-h48", client=Client(),
+                        quotes={t: book for t in "ABC"}, closes={})
+        assert out[-1]["status"] == "exchange_unavailable"
+    assert len(buys) == 3                              # one attempt per cycle, then stop
+    st = State.load(tmp_path / "state_live.json")
+    assert st.consecutive_errors == 0 and not st.halted
+    run_cycle(cfg, sim, "desk@ALL-h48", client=Client(), quotes={t: book for t in "ABC"},
+              closes={})                               # real order errors still halt
+    assert State.load(tmp_path / "state_live.json").halted == "3 consecutive order errors"
+
+
+def test_kalshi_downtime_on_exits_stops_buys_without_halting(tmp_path):
+    from executor.client import TradingError
+    from executor.runner import run_cycle
+    from executor.safety import State
+    from predlab.backtest.execution import Quote
+    sim, cfg, now = _down_setup(tmp_path, {"side": "yes", "take_profit": 0.60, "stop": 0.35})
+    exits, buys = [], []
+
+    class Client:
+        def balance_usd(self):
+            return 25.0, 4.0
+
+        def positions(self):
+            return [{"ticker": "A", "side": "yes", "qty": 6, "exposure_usd": 2.4,
+                     "fees_usd": 0.1}]
+
+        def place_ioc_exit(self, *a):
+            exits.append(a[0])
+            raise TradingError(409, '{"error":{"code":"exchange_is_paused"}}')
+
+        def place_ioc_buy(self, *a):
+            buys.append(a)
+
+    book = Quote(now, "book", [(0.40, 500.0)], [(0.61, 500.0)], 0.65, 0.35)
+    for _ in range(4):
+        out = run_cycle(cfg, sim, "desk@ALL-h48", client=Client(),
+                        quotes={t: book for t in "ABC"}, closes={})
+        assert out[0]["status"] == "exchange_unavailable"
+        assert out[-1] == {"status": "no_buys", "reason": "Kalshi unavailable"}
+    assert len(exits) == 4 and buys == []              # retried every run, nothing bought
+    st = State.load(tmp_path / "state_live.json")
+    assert st.consecutive_errors == 0 and not st.halted

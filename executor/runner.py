@@ -112,6 +112,15 @@ def _sync_resting(client, state: State, audit: AuditLog
     return cost, by_ex
 
 
+_DOWN_CODES = ("exchange_is_paused", "trading_is_paused", "service_unavailable")
+
+
+def _kalshi_down(e: Exception) -> bool:
+    """Kalshi itself is unavailable (maintenance, paused, 503): nothing reached the book."""
+    return isinstance(e, TradingError) and (
+        e.status == 503 or any(c in str(e) for c in _DOWN_CODES))
+
+
 def run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, **kw) -> list[dict]:
     """One cycle, never two at once: a second run waits up to two minutes, then refuses."""
     data = Path(cfg.data_dir)
@@ -247,6 +256,13 @@ def _run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, *,
             try:
                 ack = client.place_ioc_exit(ex.ticker, ex.held, ex.count, ex.min_price)
             except (TradingError, OSError) as e:
+                if _kalshi_down(e):
+                    # Not our error: stop trading this cycle, retry next run, no halt count.
+                    audit.write("exchange_unavailable", ticker=ex.ticker, error=str(e)[:200])
+                    results.append({"ticker": ex.ticker, "status": "exchange_unavailable",
+                                    "reason": str(e)})
+                    no_buys = "Kalshi unavailable"
+                    break
                 state.consecutive_errors += 1
                 audit.write("exit_error", ticker=ex.ticker, error=str(e))
                 results.append({"ticker": ex.ticker, "status": "exit_error", "reason": str(e)})
@@ -401,6 +417,14 @@ def _run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, *,
                 else:
                     break                   # one shared pool, and it's empty
                 continue
+            if _kalshi_down(e):
+                # Kalshi is down: no more orders this cycle, retry next run, no halt count.
+                # Resting buys can't be cancelled now; they expire on Kalshi's side.
+                audit.write("exchange_unavailable", ticker=r.ticker, error=str(e)[:200])
+                results.append({"ticker": r.ticker, "status": "exchange_unavailable",
+                                "reason": str(e)})
+                mine.clear()
+                break
             # Unknown whether it reached the exchange: never auto-resubmit; the next
             # cycle reconciles positions and resting orders from Kalshi first.
             state.consecutive_errors += 1

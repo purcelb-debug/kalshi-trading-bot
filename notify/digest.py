@@ -123,6 +123,7 @@ def _audit_lines(cfg: NotifySettings, state: dict) -> tuple[list[str], list[str]
     if f.stat().st_size < seen["offset"]:
         seen["offset"] = 0                  # file replaced: start over
     blocked: dict[str, int] = {}
+    down = 0
     standing = seen.setdefault("standing", {})
     plan: dict = {}
     with f.open("rb") as fh:
@@ -158,29 +159,44 @@ def _audit_lines(cfg: NotifySettings, state: dict) -> tuple[list[str], list[str]
                 if standing.get("halted") != rec["halted"]:
                     out.append(f"Trading HALTED: {rec['halted']}")
                     standing["halted"] = rec["halted"]
-            elif ev == "cycle_start":
-                standing["halted"] = ""
+            elif ev in ("cycle_start", "resume"):
+                # Trading again: the next halt or refusal is news even if worded the same.
+                standing["halted"] = standing["refused"] = ""
+                standing.pop("reminded", None)
+            elif ev == "exchange_unavailable":
+                down += 1
             elif ev == "profit_target_reached" and standing.get("target") != rec.get("day"):
                 standing["target"] = rec.get("day")
                 out.append(f"Daily goal reached ({_money(rec.get('up_usd', 0), sign=True)}): "
                            "no new buys until tomorrow")
-            elif ev == "cycle_refused" and standing.get("refused") != rec.get("reason"):
-                standing["refused"] = rec.get("reason")
-                out.append(f"Trading paused: {rec.get('reason')}")
+            elif ev == "cycle_refused":
+                reason, ts = str(rec.get("reason")), rec.get("ts", "")
+                if standing.get("refused") != reason:
+                    standing["refused"], standing["reminded"] = reason, ts
+                    out.append(f"Trading paused: {reason}")
+                elif reason.startswith("halted") and ts and standing.get("reminded") and \
+                        datetime.fromisoformat(ts) - datetime.fromisoformat(
+                            standing["reminded"]) >= timedelta(hours=cfg.halt_reminder_hours):
+                    standing["reminded"] = ts
+                    out.append(f"Still halted, no orders placed: {reason}")
+    if down:
+        out.append(f"Kalshi unavailable ({down}x), no orders then; retrying each run")
     out += [f"{n} buy{'s' if n > 1 else ''} skipped: {why}" for why, n in blocked.items()]
     return trades, out
 
 
-def _desk_lines(cfg: NotifySettings, state: dict) -> list[str]:
+def _desk_lines(cfg: NotifySettings, state: dict, bought: int = 0) -> list[str]:
+    """Desk picks are forecasts, not orders: ``bought`` is how many buys the bot actually
+    filled in this update (all strategies), so a halted bot shows picks with 0 bought."""
     d = Path(cfg.report_dir) / "desk-meetings"
     last = state.get("desk_last", "")
     new = sorted(p for p in d.glob("*.txt") if p.name > last) if d.is_dir() else []
     if not new:
         return []
     state["desk_last"] = new[-1].name
-    buys = sum(p.read_text(encoding="utf-8").count("recorded BUY") for p in new)
+    picks = sum(p.read_text(encoding="utf-8").count("recorded BUY") for p in new)
     return [(f"Desk: {len(new)} meeting{'s' if len(new) > 1 else ''}, "
-            f"{buys or 'no'} buy{'' if buys == 1 else 's'}")]
+            f"{picks or 'no'} pick{'' if picks == 1 else 's'} (bot bought {bought})")]
 
 
 def _stale_lines(cfg: NotifySettings, state: dict, now: datetime) -> list[str]:
@@ -262,7 +278,7 @@ def build_messages(cfg: NotifySettings, state: dict, now: datetime | None = None
     ledger = _ledger(cfg)
     trades, problems = _audit_lines(cfg, state)
     lines = (_stale_lines(cfg, state, now) + trades + _settlement_lines(ledger, state)
-             + problems + _desk_lines(cfg, state) + _target_lines(cfg, ledger, state, now)
+             + problems + _desk_lines(cfg, state, sum(t.startswith("Bought") for t in trades)) + _target_lines(cfg, ledger, state, now)
              + _capital_lines(cfg, state))
     if not lines:
         return []

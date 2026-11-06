@@ -15,6 +15,7 @@ class NotifySettings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     stale_after_hours: float = 2.0          # warn when the loop report is older than this
+    halt_reminder_hours: float = 3.0        # repeat "still halted" this often until resumed
     report_dir: str = str(ROOT / "reports")
     #: Owner's success baseline (2026-11-02): the account must make at least this many
     #: dollars per day. Reported daily and weekly; it never changes how the bot trades.
