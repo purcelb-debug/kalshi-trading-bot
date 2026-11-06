@@ -117,7 +117,7 @@ def startup_checks(cfg: ExecutorSettings, state: State) -> Check:
 
 def pre_trade_check(cfg: ExecutorSettings, state: State, *, cost_usd: float, cash_usd: float,
                     open_exposure_usd: float, market_exposure_usd: float,
-                    total_value_usd: float) -> Check:
+                    total_value_usd: float, event_exposure_usd: float = 0.0) -> Check:
     """Every limit is re-checked immediately before each individual order."""
     if kill_switch_on(cfg):
         return Check(False, "kill switch present")
@@ -136,6 +136,9 @@ def pre_trade_check(cfg: ExecutorSettings, state: State, *, cost_usd: float, cas
                             f"bankroll cap ${cfg.bankroll_cap_usd:.2f}")
     if cfg.max_market_usd is not None and market_exposure_usd + cost_usd > cfg.max_market_usd:
         return Check(False, "per-market cap exceeded")
+    if cfg.max_event_usd is not None and event_exposure_usd + cost_usd > cfg.max_event_usd + 1e-9:
+        return Check(False, f"event cap ${cfg.max_event_usd:.2f} reached "
+                            f"(${event_exposure_usd:.2f} already in this event)")
     if cost_usd > cash_usd:
         return Check(False, "insufficient cash")
     if state.day_start_value_usd is not None and \

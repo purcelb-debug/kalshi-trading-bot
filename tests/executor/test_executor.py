@@ -633,3 +633,49 @@ def test_kalshi_downtime_on_exits_stops_buys_without_halting(tmp_path):
     assert len(exits) == 4 and buys == []              # retried every run, nothing bought
     st = State.load(tmp_path / "state_live.json")
     assert st.consecutive_errors == 0 and not st.halted
+
+
+def test_event_cap_limits_money_across_strikes_of_one_event(tmp_path):
+    import pandas as pd
+
+    from executor.client import OrderAck
+    from executor.config import GATE_OVERRIDE_PHRASE
+    from executor.runner import event_of, run_cycle
+    from predlab.backtest.execution import Quote
+    from predlab.db.repo import init_sim_db, make_engine
+    from predlab.forecasts import record_forecasts
+    from predlab.models.base import Forecast
+    from predlab.timeutil import utcnow
+    assert event_of("KXHIGHNY-26NOV06-B67.5") == "KXHIGHNY-26NOV06"
+    sim = make_engine(f"sqlite:///{tmp_path / 'sim.db'}")
+    init_sim_db(sim)
+    now = pd.Timestamp(utcnow())
+    tickers = ["EV-1-A", "EV-1-B", "EV-1-C", "OTHER-2-A"]
+    record_forecasts(sim, [Forecast(t, "desk@ALL-h48", 0.80, None, None, now, now, (), {})
+                           for t in tickers])
+    buys = []
+
+    class Client:
+        def balance_usd(self):
+            return 60.0, 4.0
+
+        def positions(self):        # $4 already held in the event, from another strategy
+            return [{"ticker": "EV-1-Z", "side": "yes", "qty": 10, "exposure_usd": 4.0,
+                     "fees_usd": 0.1}]
+
+        def place_ioc_buy(self, ticker, outcome, count, price):
+            buys.append((ticker, count * price))
+            return OrderAck("o", "c", float(count), 0.0, price, 0.01)
+
+    book = Quote(now, "book", [(0.40, 500.0)], [(0.41, 500.0)], 0.65, 0.35)
+    cfg = ExecutorSettings(_env_file=None, mode="live", live_key_id="k", live_key_path="p",
+                           data_dir=str(tmp_path), kill_switch_path=str(tmp_path / "KILL"),
+                           bankroll_cap_usd=60, max_order_usd=10, daily_loss_stop_usd=25,
+                           max_event_usd=15, gate_override=GATE_OVERRIDE_PHRASE,
+                           attended=False)
+    out = run_cycle(cfg, sim, "desk@ALL-h48", client=Client(),
+                    quotes={t: book for t in tickers}, closes={})
+    in_event = sum(c for t, c in buys if t.startswith("EV-1-"))
+    assert 4.0 + in_event <= 15 + 1e-9 and len([t for t, _ in buys if t.startswith("EV-")]) >= 1
+    assert any(t == "OTHER-2-A" for t, _ in buys)       # other events are unaffected
+    assert any("event cap $15.00 reached on EV-1" in str(r.get("reason")) for r in out)

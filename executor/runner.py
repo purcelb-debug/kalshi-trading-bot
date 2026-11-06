@@ -121,6 +121,11 @@ def _kalshi_down(e: Exception) -> bool:
         e.status == 503 or any(c in str(e) for c in _DOWN_CODES))
 
 
+def event_of(ticker: str) -> str:
+    """Kalshi market ticker -> its event (KXHIGHNY-26NOV06-B67.5 -> KXHIGHNY-26NOV06)."""
+    return ticker.rsplit("-", 1)[0]
+
+
 def run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, **kw) -> list[dict]:
     """One cycle, never two at once: a second run waits up to two minutes, then refuses."""
     data = Path(cfg.data_dir)
@@ -370,6 +375,17 @@ def _run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, *,
             plan = replace(plan, count=n, cost_usd=round(plan.cost_usd / plan.count * n, 2)) \
                 if n >= 1 else None
             why = why or f"not enough cash on exchange {ex}"
+        ev = event_of(r.ticker)
+        in_event = sum(v for t, v in (*exposure.items(), *resting_cost.items())
+                       if event_of(t) == ev)
+        room = (cfg.max_event_usd - in_event) if cfg.max_event_usd is not None else math.inf
+        if plan is not None and plan.count * plan.max_price > room + 1e-9:
+            # Shrink to what's left of the event budget, but never below the minimum order.
+            n = math.floor(max(room, 0.0) / plan.max_price + 1e-9)
+            if n >= 1 and n * plan.max_price >= (cfg.min_order_usd or 0) - 1e-9:
+                plan = replace(plan, count=n, cost_usd=round(plan.cost_usd / plan.count * n, 2))
+            else:
+                plan, why = None, f"event cap ${cfg.max_event_usd:.2f} reached on {ev}"
         if plan is None:
             results.append({"ticker": r.ticker, "status": "skipped", "reason": why})
             continue
@@ -377,7 +393,7 @@ def _run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, *,
                               open_exposure_usd=sum(exposure.values())
                               + sum(resting_cost.values()),
                               market_exposure_usd=exposure.get(r.ticker, 0.0),
-                              total_value_usd=total_value)
+                              total_value_usd=total_value, event_exposure_usd=in_event)
         if not chk.ok:
             if "daily loss stop" in chk.reason:
                 state.halted = chk.reason
