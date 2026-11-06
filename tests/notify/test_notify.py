@@ -175,3 +175,32 @@ def test_daily_target_reported_once_per_finished_day(tmp_path):
                         "goal met 1 of 1")
     again = build_messages(cfg, state, now=now, exec_cfg=ExecutorSettings(_env_file=None))
     assert again == []                                                  # once per day
+
+
+def test_resting_order_fill_is_reported_as_a_buy(tmp_path):
+    cfg, state = _cfg(tmp_path), {}
+    _balance(tmp_path, 20.0, 1.35)
+    log = AuditLog(tmp_path / "exec" / "audit_live.jsonl")
+    log.write("cycle_start", mode="live")
+    build_messages(cfg, state, NOW, _exec())                 # first sight: start at the end
+    log.write("maker_fill", order_id="o1", ticker="T-1", outcome="no", fill_count=3.0,
+              price=0.45, model_version="m@S-h30")
+    (msg,) = build_messages(cfg, state, NOW, _exec())
+    assert "• Bought 3 NO T-1 at 45¢ ($1.35, resting order)" in msg
+
+
+def test_capital_step_needs_trades_and_profit_and_fires_once_per_step():
+    from notify.digest import capital_step
+
+    def report(trades, pnl):
+        row = {"trades": trades, "net_pnl": pnl, "fees": 1.0}
+        return {"bot": {"settled": {"by_category": [row]}, "exit": {"by_category": []}}}
+
+    steps = "30:60,60:100"
+    assert capital_step(report(29, 5.0), steps, 0) is None           # not enough trades
+    assert capital_step(report(40, -0.5), steps, 0) is None          # not profitable
+    n, msg = capital_step(report(31, 4.2), steps, 0)
+    assert n == 30 and "$60.00" in msg and "+$4.20" in msg and "won't change it" in msg
+    assert capital_step(report(45, 6.0), steps, 30) is None          # already told
+    assert capital_step(report(70, 9.0), steps, 30)[0] == 60         # next step
+    assert capital_step(report(70, 9.0), steps, 0)[0] == 60          # skip straight to the top

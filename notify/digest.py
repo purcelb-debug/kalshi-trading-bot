@@ -142,6 +142,12 @@ def _audit_lines(cfg: NotifySettings, state: dict) -> tuple[list[str], list[str]
                 verb = "Bought" if ev == "order_ack" else f"Sold ({plan.get('reason', 'exit')})"
                 trades.append(f"{verb} {n:g} {held.upper()} {plan.get('ticker', '?')} at "
                               f"{px * 100:.0f}¢ ({_money(n * px)})")
+            elif ev == "maker_fill" and rec.get("fill_count"):
+                # A resting buy filled after it was placed (prices are the side bought).
+                n, px = rec["fill_count"], float(rec.get("price") or 0)
+                trades.append(f"Bought {n:g} {str(rec.get('outcome', 'yes')).upper()} "
+                              f"{rec.get('ticker', '?')} at {px * 100:.0f}¢ ({_money(n * px)}, "
+                              "resting order)")
             elif ev in ("order_error", "exit_error"):
                 out.append(f"Order problem on {rec.get('ticker')}: {str(rec.get('error'))[:80]}")
             elif ev == "order_blocked":
@@ -216,6 +222,39 @@ def _target_lines(cfg: NotifySettings, ledger, state: dict, now: datetime) -> li
             f"{_money(week['pnl'].mean(), sign=True)}/day, goal met {met} of {len(week)}")]
 
 
+def capital_step(report: dict, steps: str, announced: int) -> tuple[int, str] | None:
+    """(trades threshold, message) for the highest bankroll step newly earned, or None.
+    Earned = at least that many closed bot trades (settled plus early exits) and positive
+    total net P&L across them."""
+    rows = [r for kind in ("settled", "exit")
+            for r in report.get("bot", {}).get(kind, {}).get("by_category", [])]
+    trades = sum(r["trades"] for r in rows)
+    pnl = sum(r["net_pnl"] for r in rows)
+    fees = sum(r["fees"] for r in rows)
+    pairs = sorted((int(a), float(b)) for a, b in (s.split(":") for s in steps.split(",") if s))
+    earned = [(n, cap) for n, cap in pairs if trades >= n > announced]
+    if pnl <= 0 or not earned:
+        return None
+    n, cap = earned[-1]
+    return n, (f"Capital step earned: {trades} closed bot trades, net {_money(pnl, sign=True)} "
+               f"after {_money(fees)} fees. If you want to scale up, raise "
+               f"EXECUTOR_BANKROLL_CAP_USD to {_money(cap)} (and deposit on Kalshi). "
+               "The bot won't change it itself.")
+
+
+def _capital_lines(cfg: NotifySettings, state: dict) -> list[str]:
+    from executor.performance import load_report
+    try:
+        report = load_report(cfg.executor_data_dir, cfg.sim_db_path)
+    except Exception:  # noqa: BLE001 - no ledger yet, or one being written: try next digest
+        return []
+    step = capital_step(report, cfg.capital_steps, int(state.get("capital_step", 0)))
+    if step is None:
+        return []
+    state["capital_step"] = step[0]
+    return [step[1]]
+
+
 def build_messages(cfg: NotifySettings, state: dict, now: datetime | None = None,
                    exec_cfg: ExecutorSettings | None = None) -> list[str]:
     """The message to send now (or none); mutates ``state`` to mark events reported."""
@@ -223,7 +262,8 @@ def build_messages(cfg: NotifySettings, state: dict, now: datetime | None = None
     ledger = _ledger(cfg)
     trades, problems = _audit_lines(cfg, state)
     lines = (_stale_lines(cfg, state, now) + trades + _settlement_lines(ledger, state)
-             + problems + _desk_lines(cfg, state) + _target_lines(cfg, ledger, state, now))
+             + problems + _desk_lines(cfg, state) + _target_lines(cfg, ledger, state, now)
+             + _capital_lines(cfg, state))
     if not lines:
         return []
     return [_header(cfg, ledger, now) + "\n\n" + "\n".join(f"• {x}" for x in lines)]

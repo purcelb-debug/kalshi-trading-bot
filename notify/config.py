@@ -19,6 +19,11 @@ class NotifySettings(BaseSettings):
     #: Owner's success baseline (2026-11-02): the account must make at least this many
     #: dollars per day. Reported daily and weekly; it never changes how the bot trades.
     daily_target_usd: float = 8.0
+    #: Bankroll steps the owner may choose to take, as "closed bot trades:new cap" pairs.
+    #: When the bot has closed that many trades with positive net P&L, one message says
+    #: so with the evidence. The bot never raises its own cap.
+    capital_steps: str = "30:60,60:100"
+    sim_db_path: str = str(ROOT / "data" / "sim.db")
     executor_data_dir: str = str(ROOT / "executor" / "data")
     state_path: str = str(ROOT / "data" / "notify_state.json")
 
