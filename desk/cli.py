@@ -40,6 +40,25 @@ def register(series: str = typer.Option(...), horizon: float = 30.0):
 
 
 @app.command()
+def record(deployment: str = typer.Option("desk@ALL-h48")):
+    """Score the desk's paper picks against the market on settled markets, and say whether
+    it has earned live trading back (50+ settled picks with a lower Brier than the market)."""
+    import asyncio
+
+    from desk.record import MIN_SETTLED, desk_picks, fetch_results, score
+
+    _, sim = _engines()
+    picks = desk_picks(sim, deployment)
+    s = score(picks, asyncio.run(fetch_results(picks["ticker"].tolist())))
+    f = (lambda v: "n/a" if v is None else f"{v:.4f}")
+    typer.echo(f"{deployment}: {s['picks']} picks, {s['settled']} settled, Brier desk "
+               f"{f(s['brier_desk'])} vs market {f(s['brier_market'])}")
+    typer.echo("Ready for live: yes" if s["ready_for_live"] else
+               f"Ready for live: no (needs {MIN_SETTLED}+ settled and a lower Brier than "
+               "the market)")
+
+
+@app.command()
 def cycle(deployment: str = typer.Option("desk@KXHIGHNY-h30"),
           all_: bool = typer.Option(False, "--all", help="every registered desk deployment"),
           dry: bool = typer.Option(False, "--dry", help="show the table; no LLM calls"),

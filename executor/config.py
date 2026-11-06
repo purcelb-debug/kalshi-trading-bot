@@ -37,6 +37,9 @@ class ExecutorSettings(BaseSettings):
 
     # Money limits, in dollars. None = not configured = demo/live refuse to run.
     bankroll_cap_usd: float | None = Field(default=None, gt=0)
+    #: Owner's choice (2026-11-06): the bankroll is whatever is available on Kalshi at the
+    #: time (cash minus resting buys). Replaces bankroll_cap_usd; the other limits stay.
+    cap_to_available: bool = False
     max_order_usd: float | None = Field(default=None, gt=0)
     daily_loss_stop_usd: float | None = Field(default=None, gt=0)
     max_market_usd: float | None = Field(default=None, gt=0)
@@ -52,6 +55,10 @@ class ExecutorSettings(BaseSettings):
     max_orders_per_day: int = Field(default=20, gt=0)
     max_consecutive_errors: int = Field(default=3, gt=0)
     min_edge: float = 0.03               # $/contract expected value after fees
+    #: Skip a buy whose (shrunk) forecast is more than this above the price paid. A gap that
+    #: wide on a traded market is almost always a forecast error (2026-11-06: the desk's
+    #: 25-30c "edges" on FX and crypto went to zero). None = no limit.
+    max_forecast_gap: float | None = Field(default=None, gt=0)
     kelly_fraction: float = 0.25
     shrink: float = Field(default=0.5, ge=0.0, le=1.0)   # pull forecasts toward market mid
     min_entry_price: float = 0.05
@@ -100,8 +107,13 @@ class ExecutorSettings(BaseSettings):
         return self.mode == "live" and self.gate_override == GATE_OVERRIDE_PHRASE
 
     def missing_limits(self) -> list[str]:
-        return [n for n in ("bankroll_cap_usd", "max_order_usd", "daily_loss_stop_usd")
-                if getattr(self, n) is None]
+        need = (() if self.cap_to_available else ("bankroll_cap_usd",)) + (
+            "max_order_usd", "daily_loss_stop_usd")
+        return [n for n in need if getattr(self, n) is None]
+
+    @property
+    def bankroll_label(self) -> str:
+        return "available balance" if self.cap_to_available else f"${self.bankroll_cap_usd:g}"
 
     @property
     def base_url(self) -> str:

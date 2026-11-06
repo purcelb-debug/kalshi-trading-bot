@@ -21,7 +21,9 @@ PAPER_ONLY = [               # paper loop only: no model here has beaten the mar
     "market_implied+platt-5e74e39fb3@KXHIGHMIA-h30",
 ]
 DESK_LIVE = [                # LLM desk deployments the executor trades (exits + buys)
-    "desk@ALL-h48",
+    # desk@ALL-h48 back to paper 2026-11-06 (lost ~$20 on overconfident picks); return it
+    # only once `python -m desk.cli record` shows 50+ settled picks with Brier beating the
+    # market.
 ]
 PY = ROOT / ".venv" / "Scripts" / "python.exe"
 STEPS = (

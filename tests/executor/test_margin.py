@@ -272,3 +272,30 @@ def test_cash_held_by_resting_orders_is_not_spent_twice(tmp_path):
     run_cycle(cfg, sim, mv, client=c, quotes={"A": q}, exchanges={"A": 0})
     ((_, _, count, price),) = c.placed
     assert count * price <= 5.0 + 1e-9
+
+
+def test_resting_buy_is_dropped_not_chased_when_price_and_forecast_fall(tmp_path):
+    """2026-11-06: an AUDUSD buy was re-priced 9 times down as the price and the desk's own
+    forecast fell, then went to zero. A falling price alone may still re-price."""
+    from executor.runner import run_cycle
+    from predlab.forecasts import record_forecasts
+    from predlab.models.base import Forecast
+    mv = "m@S-h30"
+    sim = _sim(tmp_path, [("A", mv, 0.62, {}), ("B", mv, 0.62, {})])
+    c = MakerClient()
+    cfg = _cfg(tmp_path, order_style="maker", min_edge=0.04, kelly_fraction=0.5, shrink=1.0)
+    now = pd.Timestamp(utcnow())
+    q1 = Quote(now, "book", [(0.50, 9.0)], [(0.55, 9.0)], 0.44, 0.48)
+    run_cycle(cfg, sim, mv, client=c, quotes={"A": q1, "B": q1})
+    assert [p[0] for p in c.placed] == ["A", "B"]
+    later = pd.Timestamp(utcnow())
+    record_forecasts(sim, [Forecast("A", mv, 0.58, None, None, later, later, (), {})])
+    q2 = Quote(now, "book", [(0.50, 9.0)], [(0.59, 9.0)], 0.40, 0.48)    # bid 44c -> 40c
+    out = {r["ticker"]: r for r in run_cycle(cfg, sim, mv, client=c, quotes={"A": q2, "B": q2})}
+    assert out["A"]["reason"] == "dropped: price and forecast fell"
+    assert [p[0] for p in c.placed] == ["A", "B", "B"]    # B (same forecast) re-priced, A not
+    assert c.placed[-1][3] == 0.41
+    run_cycle(cfg, sim, mv, client=c, quotes={"A": q2, "B": q2})
+    assert [p[0] for p in c.placed].count("A") == 1        # and never bought again
+    state = json.loads((tmp_path / "state_live.json").read_text())
+    assert state["dropped"] == ["A"] and all(o["ticker"] != "A" for o in state["resting"].values())

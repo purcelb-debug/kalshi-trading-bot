@@ -106,7 +106,7 @@ fills, settles, bal = load(DATA)
 events = audit_events()
 if len(bal):
     st.caption(md(f"Last synced {local(bal['ts']).iloc[-1]:%b %d, %I:%M %p} · syncs hourly with "
-               f"the trading job · limits: bankroll ${cfg.bankroll_cap_usd:g}, max order "
+               f"the trading job · limits: bankroll {cfg.bankroll_label}, max order "
                f"${cfg.max_order_usd:g}, daily loss stop ${cfg.daily_loss_stop_usd:g}"))
 else:
     st.info("No ledger yet. Click **Sync now** (or wait for the hourly job).")

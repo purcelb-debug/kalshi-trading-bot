@@ -26,8 +26,11 @@ class State:
     halted: str = ""                      # non-empty = halted, with the reason
     history: list = field(default_factory=list)
     closed: list = field(default_factory=list)   # tickers sold by an exit: never re-bought
+    #: tickers whose resting buy was dropped because price and forecast both fell: never
+    #: re-bought, so the bot doesn't average down into a falling market.
+    dropped: list = field(default_factory=list)
     #: resting maker buys this bot placed: order_id -> {ticker, model_version, outcome,
-    #: price, count, filled, ts}. Anything not listed here (e.g. a manual order) is never
+    #: price, p (forecast for that side), count, filled, ts}. Anything not listed here (e.g. a manual order) is never
     #: cancelled by the bot.
     resting: dict = field(default_factory=dict)
 
@@ -131,7 +134,7 @@ def pre_trade_check(cfg: ExecutorSettings, state: State, *, cost_usd: float, cas
         return Check(True)
     if cost_usd > cfg.max_order_usd:
         return Check(False, f"order ${cost_usd:.2f} > max_order_usd ${cfg.max_order_usd:.2f}")
-    if open_exposure_usd + cost_usd > cfg.bankroll_cap_usd:
+    if not cfg.cap_to_available and open_exposure_usd + cost_usd > cfg.bankroll_cap_usd:
         return Check(False, f"exposure would be ${open_exposure_usd + cost_usd:.2f} > "
                             f"bankroll cap ${cfg.bankroll_cap_usd:.2f}")
     if cfg.max_market_usd is not None and market_exposure_usd + cost_usd > cfg.max_market_usd:

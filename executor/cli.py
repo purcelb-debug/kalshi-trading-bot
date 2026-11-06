@@ -41,7 +41,7 @@ def status(model_version: str = typer.Option("", help="show go-live gate for thi
     _banner(cfg)
     state = State.load(Path(cfg.data_dir) / f"state_{cfg.mode}.json")
     typer.echo(f"mode={cfg.mode}  base_url={cfg.base_url}")
-    typer.echo(f"limits: bankroll_cap={cfg.bankroll_cap_usd} max_order={cfg.max_order_usd} "
+    typer.echo(f"limits: bankroll={cfg.bankroll_label} max_order={cfg.max_order_usd} "
                f"daily_loss_stop={cfg.daily_loss_stop_usd} max_market={cfg.max_market_usd} "
                f"max_event={cfg.max_event_usd} "
                f"max_orders/day={cfg.max_orders_per_day}")

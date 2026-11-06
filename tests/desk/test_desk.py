@@ -778,3 +778,29 @@ def test_code_checks_flips_or_sets_exit_levels_from_the_live_book():
     # NO at 1 - 0.50 = 0.50, edge 0.40: 0.50 + 0.27, 0.50 - 0.40
     assert got["D-1"] == ("no", 0.77, 0.10)
     assert sum("set by code" in n for n in notes) == 2
+
+
+def test_desk_record_scores_first_buys_against_the_market(tmp_path):
+    import pandas as pd
+
+    from desk.record import desk_picks, score
+    from predlab.db.repo import init_sim_db, make_engine
+    from predlab.forecasts import record_forecasts
+    from predlab.models.base import Forecast
+    from predlab.timeutil import utcnow
+    sim = make_engine(f"sqlite:///{tmp_path / 'sim.db'}")
+    init_sim_db(sim)
+    now = pd.Timestamp(utcnow())
+    dep = "desk@ALL-h48"
+    f = (lambda t, p, e=None: Forecast(t, dep, p, None, None, now, now, (), e or {}))
+    record_forecasts(sim, [f("A", 0.90), f("B", 0.20), f("W", 0.50, {"withdrawn": True})],
+                     market_ref={"A": 0.40, "B": 0.30, "W": 0.50})
+    record_forecasts(sim, [f("A", 0.10)], market_ref={"A": 0.40})   # later re-pick: ignored
+    picks = desk_picks(sim, dep)
+    assert picks.to_dict("records") == [{"ticker": "A", "p": 0.90, "market": 0.40},
+                                        {"ticker": "B", "p": 0.20, "market": 0.30}]
+    s = score(picks, {"A": "no", "B": "no"})            # the desk was confidently wrong on A
+    assert s["settled"] == 2 and round(s["brier_desk"], 3) == 0.425
+    assert round(s["brier_market"], 3) == 0.125 and not s["ready_for_live"]
+    many = pd.DataFrame({"ticker": [f"T{i}" for i in range(50)], "p": 0.8, "market": 0.6})
+    assert score(many, {f"T{i}": "yes" for i in range(50)})["ready_for_live"]

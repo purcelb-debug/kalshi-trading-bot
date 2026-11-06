@@ -121,9 +121,17 @@ def _kalshi_down(e: Exception) -> bool:
         e.status == 503 or any(c in str(e) for c in _DOWN_CODES))
 
 
+#: Series that bet on the same price at the same close ("BTC above X" and "BTC in range X"),
+#: so the event cap counts them as one event.
+SAME_UNDERLYING = {"KXBTCD": "KXBTC", "KXETHD": "KXETH", "KXSOLD": "KXSOL", "KXXRPD": "KXXRP"}
+
+
 def event_of(ticker: str) -> str:
-    """Kalshi market ticker -> its event (KXHIGHNY-26NOV06-B67.5 -> KXHIGHNY-26NOV06)."""
-    return ticker.rsplit("-", 1)[0]
+    """Kalshi market ticker -> its event (KXHIGHNY-26NOV06-B67.5 -> KXHIGHNY-26NOV06), with
+    same-underlying series merged (KXBTCD-26NOV0617-T75999.99 -> KXBTC-26NOV0617)."""
+    ev = ticker.rsplit("-", 1)[0]
+    series, _, rest = ev.partition("-")
+    return f"{SAME_UNDERLYING.get(series, series)}-{rest}" if rest else ev
 
 
 def run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, **kw) -> list[dict]:
@@ -318,7 +326,9 @@ def _run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, *,
             audit.write("exchange_lookup_failed", error=str(e)[:200])
             exchanges = {}
     ex_of.update(exchanges or {})
-    equity = min(total_value, cfg.bankroll_cap_usd or total_value)
+    # Kelly sizes against the bankroll: what's available now, or the account up to the cap.
+    equity = max(cash, 0.0) if cfg.cap_to_available else \
+        min(total_value, cfg.bankroll_cap_usd or total_value)
     # Trade exactly as certified: the certified kappa, or the configured shrink if that is
     # more conservative (closer to the market).
     kappa = certified_shrink(sim_engine, model_version)
@@ -329,6 +339,12 @@ def _run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, *,
             if r.ticker in mine:
                 cancel(r.ticker, "exited earlier")
             results.append({"ticker": r.ticker, "status": "skipped", "reason": "exited earlier"})
+            continue
+        if r.ticker in state.dropped:
+            if r.ticker in mine:
+                cancel(r.ticker, "dropped earlier")
+            results.append({"ticker": r.ticker, "status": "skipped",
+                            "reason": "dropped: price and forecast fell"})
             continue
         if exposure.get(r.ticker, 0.0) > 0:
             # One decision per market, as in the backtest: never add to a held position.
@@ -355,6 +371,20 @@ def _run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, *,
                                min_entry_price=cfg.min_entry_price,
                                max_entry_price=cfg.max_entry_price,
                                min_order_usd=cfg.min_order_usd, maker=maker)
+        if plan is not None and cfg.max_forecast_gap is not None:
+            gap = plan.p_side - (plan.max_price if maker else plan.best_ask)
+            if gap > cfg.max_forecast_gap + 1e-9:
+                plan, why = None, (f"forecast {gap:.2f} above price, more than "
+                                   f"{cfg.max_forecast_gap:.2f}: likely a forecast error")
+        if own and plan is not None and plan.outcome == own["outcome"] \
+                and own.get("p") is not None and plan.max_price < own["price"] - 1e-9 \
+                and plan.p_side < own["p"] - 1e-9:
+            # Price and forecast both fell: re-pricing lower would chase a falling market.
+            state.dropped = sorted({*state.dropped, r.ticker})
+            cancel(r.ticker, "price and forecast both fell")
+            results.append({"ticker": r.ticker, "status": "skipped",
+                            "reason": "dropped: price and forecast fell"})
+            continue
         if own:
             if plan is not None and plan.outcome == own["outcome"] \
                     and abs(plan.max_price - own["price"]) < 1e-9:
@@ -457,7 +487,7 @@ def _run_cycle(cfg: ExecutorSettings, sim_engine: Engine, model_version: str, *,
         if rest > 0:
             state.resting[ack.order_id] = {
                 "ticker": r.ticker, "model_version": model_version, "outcome": plan.outcome,
-                "price": plan.max_price, "count": float(plan.count),
+                "price": plan.max_price, "p": plan.p_side, "count": float(plan.count),
                 "filled": float(ack.fill_count), "ts": time.time()}
             resting_cost[r.ticker] = resting_cost.get(r.ticker, 0.0) + rest * plan.max_price
         spent = (ack.fill_count + rest) * plan.max_price      # filled, or held by the order

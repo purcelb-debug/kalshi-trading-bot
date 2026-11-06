@@ -679,3 +679,71 @@ def test_event_cap_limits_money_across_strikes_of_one_event(tmp_path):
     assert 4.0 + in_event <= 15 + 1e-9 and len([t for t, _ in buys if t.startswith("EV-")]) >= 1
     assert any(t == "OTHER-2-A" for t, _ in buys)       # other events are unaffected
     assert any("event cap $15.00 reached on EV-1" in str(r.get("reason")) for r in out)
+
+
+def test_cap_to_available_uses_the_balance_not_a_fixed_cap(tmp_path):
+    from executor.safety import State, pre_trade_check
+    cfg = ExecutorSettings(_env_file=None, mode="live", max_order_usd=10, daily_loss_stop_usd=25,
+                           cap_to_available=True, kill_switch_path=str(tmp_path / "KILL"))
+    assert cfg.missing_limits() == [] and cfg.bankroll_label == "available balance"
+    args = {"open_exposure_usd": 500.0, "market_exposure_usd": 0.0, "total_value_usd": 520.0}
+    # Lots already invested is fine while cash covers the order...
+    assert pre_trade_check(cfg, State(), cost_usd=8, cash_usd=20, **args).ok
+    # ...but never more than what's available, and max order still applies.
+    assert pre_trade_check(cfg, State(), cost_usd=8, cash_usd=5, **args).reason == \
+        "insufficient cash"
+    assert not pre_trade_check(cfg, State(), cost_usd=12, cash_usd=50, **args).ok
+    fixed = ExecutorSettings(_env_file=None, mode="live", max_order_usd=10,
+                             daily_loss_stop_usd=25)
+    assert fixed.missing_limits() == ["bankroll_cap_usd"]  # off by default: cap required
+
+
+def test_same_underlying_series_share_one_event_cap():
+    from executor.runner import event_of
+    assert event_of("KXBTCD-26NOV0617-T75999.99") == event_of("KXBTC-26NOV0617-B76250") \
+        == "KXBTC-26NOV0617"
+    assert event_of("KXETHD-26NOV0617-T2319.99") == event_of("KXETH-26NOV0617-B2220")
+    assert event_of("KXBTC-26NOV0617-B1") != event_of("KXBTC-26NOV0618-B1")   # other close
+    assert event_of("KXHIGHDEN-26NOV05-B56.5") == "KXHIGHDEN-26NOV05"
+
+
+def test_forecast_far_above_the_price_is_skipped_as_a_likely_error(tmp_path):
+    import pandas as pd
+
+    from executor.client import OrderAck
+    from executor.config import GATE_OVERRIDE_PHRASE
+    from executor.runner import run_cycle
+    from predlab.backtest.execution import Quote
+    from predlab.db.repo import init_sim_db, make_engine
+    from predlab.forecasts import record_forecasts
+    from predlab.models.base import Forecast
+    from predlab.timeutil import utcnow
+    sim = make_engine(f"sqlite:///{tmp_path / 'sim.db'}")
+    init_sim_db(sim)
+    now = pd.Timestamp(utcnow())
+    # Shrunk halfway to the 38c mid: WILD -> 0.67 (26c over the 41c ask), SANE -> 0.53.
+    record_forecasts(sim, [Forecast(t, "desk@ALL-h48", p, None, None, now, now, (), {})
+                           for t, p in (("WILD", 0.96), ("SANE", 0.68))])
+    buys = []
+
+    class Client:
+        def balance_usd(self):
+            return 60.0, 0.0
+
+        def positions(self):
+            return []
+
+        def place_ioc_buy(self, ticker, outcome, count, price):
+            buys.append(ticker)
+            return OrderAck("o", "c", float(count), 0.0, price, 0.01)
+
+    book = Quote(now, "book", [(0.41, 500.0)], [(0.65, 500.0)], 0.35, 0.59)
+    cfg = ExecutorSettings(_env_file=None, mode="live", live_key_id="k", live_key_path="p",
+                           data_dir=str(tmp_path), kill_switch_path=str(tmp_path / "KILL"),
+                           bankroll_cap_usd=60, max_order_usd=10, daily_loss_stop_usd=25,
+                           max_forecast_gap=0.15, shrink=0.5, min_edge=0.04,
+                           gate_override=GATE_OVERRIDE_PHRASE, attended=False)
+    out = {r["ticker"]: r for r in run_cycle(cfg, sim, "desk@ALL-h48", client=Client(),
+                                             quotes={"WILD": book, "SANE": book}, closes={})}
+    assert buys == ["SANE"]
+    assert "likely a forecast error" in out["WILD"]["reason"]
