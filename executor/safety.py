@@ -26,6 +26,10 @@ class State:
     halted: str = ""                      # non-empty = halted, with the reason
     history: list = field(default_factory=list)
     closed: list = field(default_factory=list)   # tickers sold by an exit: never re-bought
+    #: resting maker buys this bot placed: order_id -> {ticker, model_version, outcome,
+    #: price, count, filled, ts}. Anything not listed here (e.g. a manual order) is never
+    #: cancelled by the bot.
+    resting: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> "State":

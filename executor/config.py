@@ -13,6 +13,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 ROOT = Path(__file__).resolve().parent
 
 GATE_OVERRIDE_PHRASE = "I_ACCEPT_TRADING_AN_UNVALIDATED_STRATEGY"
+#: Settings a deployment may override; money limits stay shared.
+STRATEGY_KEYS = {"shrink", "kelly_fraction", "min_edge"}
 
 BASE_URLS = {
     "demo": "https://external-api.demo.kalshi.co/trade-api/v2",
@@ -52,6 +54,24 @@ class ExecutorSettings(BaseSettings):
     min_entry_price: float = 0.05
     max_entry_price: float = 0.95
     max_quote_age_s: float = 60.0         # order book must be this fresh to trade
+    #: taker: IOC buy at the ask. maker: post-only buy 1c above the bid, kept while its
+    #: side and price still hold, cancelled when the edge goes, and expiring on Kalshi
+    #: after maker_ttl_min even if the bot stops running.
+    order_style: Literal["taker", "maker"] = "taker"
+    maker_ttl_min: float = Field(default=60.0, gt=0)
+    #: Positions closing within this many hours keep their take-profit but drop the stop.
+    no_stop_hours: float = Field(default=24.0, ge=0)
+    #: Per-deployment overrides, as JSON in the env:
+    #: {"<model_version>": {"shrink": 0.7, "kelly_fraction": 0.6}}. Shrink still never
+    #: goes above the deployment's certified kappa.
+    strategy_overrides: dict[str, dict[str, float]] = Field(default_factory=dict)
+
+    def for_strategy(self, model_version: str) -> "ExecutorSettings":
+        o = self.strategy_overrides.get(model_version) or {}
+        bad = set(o) - STRATEGY_KEYS
+        if bad:
+            raise ValueError(f"strategy_overrides for {model_version}: unknown {sorted(bad)}")
+        return self.model_copy(update=o) if o else self
 
     # Go-live gate (live mode only).
     gate_paper_weeks: int = Field(default=4, ge=1)

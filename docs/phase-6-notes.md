@@ -169,3 +169,51 @@ Changes:
 - Model order: Groq gpt-oss-120b is tried before the flash-lite models (`groq_before`). A
   Groq "too large for this minute" error skips the model once instead of for the whole run.
 - Scan excludes soccer leagues, college football, FIBA and KHL.
+
+## 2026-11-05: higher margin per trade (owner approved the plan)
+
+Finding (`executor perf`): the NY model's 2 settled trades made +$1.48; the desk's 13 early
+exits lost $1.93 after $2.90 in fees, mostly stops hit within 1-2 hours of buying.
+
+Changes:
+- **No stops near close.** Positions in markets closing within `EXECUTOR_NO_STOP_HOURS`
+  (24) keep their take-profit but ignore the stop. Close times come from the public
+  `GET /markets/{ticker}` call that already gives the exchange. If that lookup fails,
+  stops stay on.
+- **Resting maker buys** (`EXECUTOR_ORDER_STYLE=maker`; `taker` restores IOC at the ask).
+  - Post-only, good-till-cancelled, priced 1c above the side's bid (joining the bid on a
+    1c spread, never at or above the ask), with a Kalshi `expiration_time` of
+    `EXECUTOR_MAKER_TTL_MIN` (60) so nothing outlives a stopped bot by more than an hour.
+  - Edge, Kelly size and the limit are all at that price, with maker fees charged as if
+    the series had them (conservative).
+  - Each cycle reads the account's orders (`GET /portfolio/orders`). The bot's own resting
+    buys are tracked in `state.resting`; it keeps one when side and price are unchanged
+    (no new order, keeps its queue place), cancels it when the edge goes, the price moves,
+    the position opens, the forecast ages out or the daily goal is reached
+    (`DELETE /portfolio/events/orders/{id}`, the only DELETE path allowed). Orders not in
+    `state.resting`, such as manual ones, are never cancelled.
+  - Every resting order on the account counts as exposure for the bankroll cap, and its
+    ticker is skipped. Kalshi's balance still includes cash held by resting orders ("balance
+    only changes on fills, settlements and transfers"), so that cash is subtracted before
+    sizing. If the orders can't be read, the cycle buys nothing (exits still run).
+  - Fills on resting orders are audited as `maker_fill` and sent to Telegram as "Bought
+    ... (resting order)". The `perf` report attributes them via the `order_ack` order id.
+  - A lost POST response is never resubmitted: the next cycle sees the order resting on
+    Kalshi and skips that market, and it expires on its own.
+- **Minimum edge 2c -> 4c** (`EXECUTOR_MIN_EDGE`).
+- **Per-strategy sizing** (`EXECUTOR_STRATEGY_OVERRIDES`, JSON keyed by deployment; only
+  shrink, kelly_fraction and min_edge). NY model: shrink 0.7, Kelly 0.6. Its certified kappa
+  is 0.87 and the executor still caps shrink at kappa. Everything else stays at 0.5 / 0.5.
+- **Desk meetings per run** back to 3 (`DESK_MAX_MEETINGS_PER_CYCLE`).
+- **Capital-step alert.** The Telegram digest runs the `perf` numbers and sends one message
+  when closed bot trades (settled + exits) reach 30 with positive net P&L (suggesting a $60
+  bankroll cap), and another at 60 (suggesting $100). `CAPITAL_STEPS` in `notify/.env`
+  sets them.
+  The bot never raises its own cap.
+- **New weather cities** (Austin, Denver, Los Angeles, Philadelphia). NOAA stations added,
+  each the one its Kalshi series settles on. They run paper-only and go live only through
+  the normal evidence gate. Houston has no open markets.
+
+Unknowns: how often a 1c-better resting order fills on these books, and whether resting
+fills are adversely selected (filled mostly when the price is moving against the forecast).
+The `perf` report will show both once there are enough maker fills.

@@ -47,8 +47,11 @@ def exit_levels(sim_engine: Engine, model_version: str) -> dict[str, dict]:
     return out
 
 
-def plan_exit(position: dict, levels: dict | None, quote: Quote | None) -> ExitPlan | None:
-    """Pure rule: one held position, its levels and a fresh book -> an exit or nothing."""
+def plan_exit(position: dict, levels: dict | None, quote: Quote | None,
+              allow_stop: bool = True) -> ExitPlan | None:
+    """Pure rule: one held position, its levels and a fresh book -> an exit or nothing.
+    ``allow_stop`` False (market closes soon) keeps the take-profit and holds through
+    dips: most stops on short-dated markets fired on ordinary noise and paid fees twice."""
     if not levels or quote is None:
         return None
     held = position["side"]
@@ -61,7 +64,7 @@ def plan_exit(position: dict, levels: dict | None, quote: Quote | None) -> ExitP
     if bid >= levels["take_profit"]:
         return ExitPlan(position["ticker"], held, count, round(bid, 2), "take_profit", bid,
                         levels["take_profit"])
-    if bid <= levels["stop"]:
+    if allow_stop and bid <= levels["stop"]:
         return ExitPlan(position["ticker"], held, count, max(0.01, round(bid, 2)), "stop", bid,
                         levels["stop"])
     return None

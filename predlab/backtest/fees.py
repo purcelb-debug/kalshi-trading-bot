@@ -53,6 +53,13 @@ class FeeSchedule:
             return 0.0
         return self.stress * self.multiplier * TAKER_COEF * price * (1 - price)
 
+    def per_contract_maker(self, price: float) -> float:
+        """Unrounded maker cost per contract, charged as if the series had maker fees
+        (conservative: the series' fee type isn't known when the executor sizes)."""
+        if self.no_fees:
+            return 0.0
+        return self.stress * self.multiplier * MAKER_COEF * price * (1 - price)
+
     @classmethod
     def from_series(cls, fee_type: str | None, fee_multiplier: float | None,
                     stress: float = 1.0) -> "FeeSchedule":

@@ -1,4 +1,5 @@
-"""Authenticated Kalshi trading client: balance, positions, order book, IOC limit orders.
+"""Authenticated Kalshi trading client: balance, positions, IOC limit orders, and resting
+post-only buys (list and cancel).
 
 Only these endpoints are reachable; anything else raises. Orders always carry a
 client_order_id so a retried POST cannot create a duplicate (Kalshi rejects a reused id
@@ -22,7 +23,16 @@ ALLOWED = {
     ("GET", "/portfolio/fills"),
     ("GET", "/portfolio/settlements"),
     ("POST", "/portfolio/events/orders"),
+    ("GET", "/portfolio/orders"),
 }
+CANCEL_PREFIX = "/portfolio/events/orders/"      # DELETE .../{order_id}, nothing deeper
+
+
+def _allowed(method: str, path: str) -> bool:
+    if (method, path) in ALLOWED:
+        return True
+    oid = path[len(CANCEL_PREFIX):] if path.startswith(CANCEL_PREFIX) else ""
+    return method == "DELETE" and bool(oid) and "/" not in oid
 
 
 class TradingError(RuntimeError):
@@ -68,7 +78,7 @@ class KalshiTradingClient:
         self._http.close()
 
     def _call(self, method: str, path: str, *, params=None, json=None):
-        if (method, path) not in ALLOWED:
+        if not _allowed(method, path):
             raise PermissionError(f"executor endpoint not allowed: {method} {path}")
         url = self.base_url + path
         headers = auth_headers(self._key_id, self._key, method, url, int(self._clock() * 1000))
@@ -172,6 +182,44 @@ class KalshiTradingClient:
             "post_only": False, "reduce_only": True, "cancel_order_on_pause": True,
         }
         return self._ack(self._call("POST", "/portfolio/events/orders", json=body), cid)
+
+    def place_maker_buy(self, ticker: str, outcome: str, count: int, price: float,
+                        expires_ts: int, client_order_id: str | None = None) -> OrderAck:
+        """Post-only resting limit buy at exactly ``price`` for ``outcome``: Kalshi rejects it
+        rather than let it take liquidity, and cancels it at ``expires_ts`` (Unix seconds)."""
+        if count < 1 or not 0.01 <= price <= 0.99:
+            raise ValueError("count must be >= 1 and price within [0.01, 0.99]")
+        cid = client_order_id or str(uuid.uuid4())
+        body = {
+            "ticker": ticker, "client_order_id": cid, "side": yes_book_side(outcome),
+            "count": str(int(count)), "price": f"{yes_leg_price(outcome, price):.4f}",
+            "time_in_force": "good_till_canceled", "expiration_time": int(expires_ts),
+            "self_trade_prevention_type": "taker_at_cross",
+            "post_only": True, "reduce_only": False, "cancel_order_on_pause": True,
+        }
+        return self._ack(self._call("POST", "/portfolio/events/orders", json=body), cid)
+
+    def orders(self, min_ts: int | None = None, status: str | None = None) -> list[dict]:
+        """This account's orders: order_id, ticker, status, remaining, filled, and ``cost``,
+        the price per contract of the side it buys (YES-leg bid = YES, ask = NO)."""
+        q = {k: v for k, v in (("min_ts", min_ts), ("status", status)) if v is not None}
+        out = []
+        for o in self._pages("/portfolio/orders", "orders", q):
+            yes_px = float(o.get("yes_price_dollars") or 0)
+            buys_yes = o.get("book_side") == "bid" if o.get("book_side") else \
+                (o.get("side") == "yes") == (o.get("action") == "buy")
+            ex = o.get("exchange_index")
+            out.append({"order_id": o["order_id"], "ticker": o.get("ticker"),
+                        "status": o.get("status"), "exchange": None if ex is None else int(ex),
+                        "remaining": float(o.get("remaining_count_fp") or 0),
+                        "filled": float(o.get("fill_count_fp") or 0),
+                        "cost": yes_px if buys_yes else round(1 - yes_px, 4)})
+        return out
+
+    def cancel_order(self, order_id: str, ticker: str) -> float:
+        """Cancel a resting order; returns the contracts cancelled (its remaining count)."""
+        d = self._call("DELETE", CANCEL_PREFIX + order_id, params={"market_ticker": ticker})
+        return float(d.get("reduced_by") or 0)
 
     @staticmethod
     def _ack(d: dict, cid: str) -> OrderAck:
